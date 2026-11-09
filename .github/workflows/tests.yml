@@ -13,5 +13,5 @@ jobs:
         with:
           python-version: "3.12"
       - run: pip install torch --index-url https://download.pytorch.org/whl/cpu
-      - run: pip install numpy xxhash transformers pytest
+      - run: pip install numpy xxhash transformers pytest "triton>=3.0.0"
       - run: pytest -q
