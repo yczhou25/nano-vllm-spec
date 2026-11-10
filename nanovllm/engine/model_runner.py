@@ -1,3 +1,4 @@
+import gc
 import pickle
 import torch
 import torch.distributed as dist
@@ -100,9 +101,17 @@ class ModelRunner:
             dist.barrier()
             if self.rank == 0:
                 self.shm.unlink()
-        del self.graphs, self.draft_graphs, self.graph_pool
+        # Everything on the GPU goes now, not when the garbage collector gets to this object: the
+        # next engine in the same process (the GPU tests build one per mode) sizes its KV cache
+        # from the memory in use and the allocator's peak, and a leftover engine takes its share.
+        for name in ("graphs", "draft_graphs", "graph_pool", "graph_vars", "draft_graph_vars",
+                     "kv_cache", "draft_kv_cache", "model", "draft_model"):
+            if hasattr(self, name):
+                delattr(self, name)
         torch.cuda.synchronize()
         dist.destroy_process_group()
+        gc.collect()
+        torch.cuda.empty_cache()
 
     def loop(self):
         while True:
@@ -234,7 +243,8 @@ class ModelRunner:
             if self.eagle:    # and the hidden cache: the target's fused hidden state of every position (see Eagle3Head)
                 block_bytes += self.block_size * config.draft_hf_config.hidden_size * config.draft_hf_config.dtype.itemsize
         config.num_kvcache_blocks = int(total * config.gpu_memory_utilization - used - peak + current) // block_bytes
-        assert config.num_kvcache_blocks > 0
+        assert config.num_kvcache_blocks > 0, (f"no room for a KV cache: {total * config.gpu_memory_utilization / 2**30:.1f} GiB budget, "
+                                             f"{used / 2**30:.1f} GiB in use on the GPU, {peak / 2**30:.1f} GiB peak allocated by this process")
         self.kv_cache = self.bind_kv_cache(self.model, config.hf_config, config.num_kvcache_blocks)
         if self.draft_model is not None:
             self.draft_kv_cache = self.bind_kv_cache(self.draft_model, config.draft_hf_config, config.num_kvcache_blocks)

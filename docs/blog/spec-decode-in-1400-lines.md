@@ -116,14 +116,14 @@ A40 上一跑，batch 32 关掉草稿后比完全不投机还慢：代码编辑 
 ## 和 vLLM 的对应关系
 
 - 异步调度：vLLM V1 的 `AsyncScheduler` 用 output placeholder 表示在途 token，model runner 保留上一步的 `sampled_token_ids` 作为下一步的输入。这里的 `num_inflight` / `inflight_row` 是同一个思路的简化版，只往前看一步。
-- 投机解码：vLLM 用 varlen 注意力支持每条序列不同的草稿数，这里统一 k+1 个 query 换取 CUDA graph 和 `flash_attn_with_kvcache` 不变；草稿 argmax、`draft_probs=None` 的拒绝采样和 vLLM V1 一致；EAGLE 草稿头没做。
+- 投机解码：vLLM 用 varlen 注意力支持每条序列不同的草稿数，这里统一 k+1 个 query 换取 CUDA graph 和 `flash_attn_with_kvcache` 不变；草稿 argmax、`draft_probs=None` 的拒绝采样和 vLLM V1 一致；EAGLE-3 草稿头写完这篇之后做了，见第三条附记。
 - 两套 KV cache 共用块 id 是 vLLM 的做法，内存代价也一样。
 
 ## 还没做的
 
 - 按接受率动态开关和调 k（上面的教训）：写完这篇之后做了，见附记。
 - 从草稿模型的分布采样草稿，按 `min(1, p/q)` 接受：温度采样下接受率更高，要多存 `(B, k, V)` 的 q。写完这篇之后做了，见第二条附记。
-- EAGLE-3 草稿头；n-gram 查找搬到 GPU 上以便和异步调度合并；张量并行的异步 + 草稿路径只在 CPU 上推演过，还没在多卡上跑。
+- EAGLE-3 草稿头：写完这篇之后做了，见第三条附记。n-gram 查找搬到 GPU 上以便和异步调度合并；张量并行的异步 + 草稿路径只在 CPU 上推演过，还没在多卡上跑。
 
 ## 附记（2026-10-26）：按接受率调 k
 
@@ -140,5 +140,11 @@ A40 上的结果（Qwen3-8B + 0.6B 草稿，作业 228654，每种负载都在�
 A40 上（作业 244661，Qwen3-8B + 0.6B，T=0.8，同一场作业内三行连比）：chat 的接受率每一位涨 0.02–0.04，整体 0.39 → 0.42，每步多收 7% 的 token，吞吐 batch 1 +3%、batch 8 +7%、batch 32 +5%（1026 → 1073 tok/s，固定 k=4 从比基线略亏变成略赚）；edit 接受率本来就 0.87，没得涨；T=0 对照一个 token 都没变。0.6B 给自己打草稿时采样草稿的接受率 > 0.9，argmax 草稿只有 0.2–0.95，GPU 测试里验到了。两个没料到的数：一是涨幅比想象的小，`Σ min(p, q)` 取决于两个模型的分布有多像，0.6B 和 8B 在开放问答上差得远，重合只比 argmax 的信心多这么一点；二是 q 不便宜，`(32, 151936)` 的 float32 softmax、噪声、相除、拷贝都在 CUDA graph 之外，每步 1.3 GB 的读写要 2–3 ms，把一半的收益吃掉了，T=0 也白付。下一步是让贪心 batch 跳过采样（已改），再把 q 收进编译好的采样器：草稿步只存 bf16 的 logits，Gumbel-max 直接在 logits 上采，p/q 要的 q 在采样器里和 p 一起算。
 
 后来（2026-11-04 到 11-08，三次 A40 作业）把 q 收进了编译的采样器：草稿步只存 bf16 的 logits，Gumbel-max 直接做在 logits 上，q 在采样器里按 `exp(logit/T − logsumexp)` 读。同场对比下采样草稿在 chat 上每个 batch 都快过 argmax 草稿（batch 32 +4–8%），T=0 的输出一个 token 都不变。但每步还是多 2 ms，profiler 一看是采样器的 kernel：一个 32 行 × 15 万列的 argmax 要 183 µs，按带宽只该 15 µs。翻 Inductor 源码才知道带 argmax 的归约它从不切分到多个线程块——一行一个块，batch 32 只用了 A40 的 32 个 SM。把归约改成两级分块（先分块各取 max 和下标，再在块间取）之后，CPU 上结果逐位相同；又两次 A40 作业量下来，`Sampler` 和拒绝采样器快了 15–26%，可一步要调 4 次的草稿采样器纹丝不动：profiler 和 Inductor 生成的代码一起看，它把 128 宽的块一会儿编成 persistent 归约一会儿编成 looped 归约，图这边控制不了，噪声张量也总要先写 19 MB 再读回。到这一步就该放弃 `torch.compile` 了：草稿采样器改成两个手写的 Triton kernel，一个 program 读一行的 1024 个 logits 进寄存器，max、下标、log-sum-exp 的两个数、带 Gumbel 噪声的 max 和下标一次读取全出，噪声用 `tl.rand` 在寄存器里按位置生成，第二个 kernel 合并各片。没有 GPU 的机器上靠 Triton 的解释器把 kernel 当 numpy 跑来测。A40 上一量：两个采样器的 GPU 时间从 207 / 167 µs 降到 64 µs，每步的差距收到 0.6 ms，而这 0.6 ms 已经能一笔笔对上账（4 次草稿采样 0.26 ms、拒绝采样器的采样分支多 0.26 ms、草稿 logits 的写读）。第一版核还卡在指令吞吐上——`tl.rand` 每次 Philox 产 4 个数只用 1 个，改 `rand4x` 后 kernel 从 60 µs 到 45 µs，采样草稿每步只比 argmax 草稿多 0.4–0.8 ms，一步的 1%。到这里就该停了：剩下的每一微秒都知道去了哪里，再省也是千分之几。
+
+## 附记（2026-11-10）：EAGLE-3 草稿头
+
+草稿模型那条线的上限是 0.6B 和 8B 有多像，而且每步还要跑它的 28 层。EAGLE-3 用一个单层的头代替整个草稿模型：头吃 target 第 2、18、33 层的隐状态（拼起来过一个线性层）和下一个 token 的 embedding，预测再下一个；往后猜时把自己的输出当隐状态喂回去。接进这套引擎只多了一样东西：target 每算一行，把这行的融合隐状态写到 KV 同一个 slot 上的"隐状态 cache"里（每块 2 MB，是 8B KV 的 5%），头补齐时按 slot 读；头的 KV 和 target 共用块表，行比 target 错一位（位置 p 吃 `t[p+1]`）。于是不带草稿的步、异步调度、抢占、前缀缓存一个都不用单独处理，调度器、拒绝采样器、自适应 k 一行不改——头的 32000 个 logits 按 `d2t` 散到 target 词表宽的 `-inf` 张量里就行。CPU 模拟器里加了个假头，逐步核对位置、slot、隐状态和头的 KV，抓出两处记账错（完整 prompt 的最后一行头还没算，不能在 prefill 这步 hash 那一块；异步下补齐行数只能按在途步最多能加的算），11 个变异体全被抓住。
+
+A40 上（Qwen3-8B，RedHatAI 的头）：chat batch 32 ×1.33（k=3），batch 1 ×1.82，edit batch 1 ×2.87；对比 0.6B 草稿模型的 ×1.07、×1.72、×3.22——头在 chat 上赢，edit 上输。赢在便宜（batch 32 每步 48.6 ms 对 60.8，基线 29.1），输在准（chat 每步接受 1.31 个对 1.62；edit 第一位接受率 0.80 对 0.92，因为头的草稿词表只有 32000 个 token，源文件里词表外的标识符永远提不出）。第二个草稿起头吃的是自己的隐状态，接受率一位比一位掉得快，所以 chat 上 k=3 赢 k=4，自适应开关自己落到 k=2；从头的分布采草稿不赚（它的 q 离 target 的 p 太远）。T=0 的输出和草稿模型版在 batch 1 上逐 token 相同，大 batch 下两种草稿在同一个 token 和基线分叉（bf16 下不同形状的 GEMM 对平局各取一边）。
 
 代码和每一步的设计说明、变异测试表、原始 benchmark 行都在仓库里：[yczhou25/nano-vllm-spec](https://github.com/yczhou25/nano-vllm-spec)。

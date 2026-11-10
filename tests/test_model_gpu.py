@@ -5,6 +5,7 @@ comparing two free-running generations, the reference scores nano-vllm's own out
 forcing, and every chosen token must be within LOGIT_TOL of the reference's best logit.
 """
 import atexit
+import gc
 import os
 
 import pytest
@@ -78,6 +79,11 @@ def llm(request):
     yield engine
     engine.exit()
     atexit.unregister(engine.exit)
+    # The next mode's engine measures the GPU's free memory; the reference model (a fixture of this
+    # one, torn down first) and the engine must be gone from it before that.
+    del engine
+    gc.collect()
+    torch.cuda.empty_cache()
 
 
 @pytest.fixture(scope="module")

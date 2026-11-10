@@ -1,4 +1,5 @@
 import atexit
+import gc
 from dataclasses import fields
 from time import perf_counter
 from tqdm.auto import tqdm
@@ -39,6 +40,7 @@ class LLMEngine:
     def exit(self):
         self.model_runner.call("exit")
         del self.model_runner
+        gc.collect()    # the runner's own cleanup freed the GPU; this frees the objects (see ModelRunner.exit)
         for p in self.ps:
             p.join()
 
