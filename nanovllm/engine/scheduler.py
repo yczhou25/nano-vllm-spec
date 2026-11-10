@@ -32,6 +32,7 @@ class Scheduler:
         self.block_manager = BlockManager(config.num_kvcache_blocks, config.kvcache_block_size)
         self.num_speculative_tokens = config.num_speculative_tokens
         self.has_draft_model = config.speculative_model is not None    # the model runner drafts on the GPU
+        self.has_eagle_head = self.has_draft_model and getattr(config, "speculative_method", None) == "eagle3"    # ... with an EAGLE-3 head, whose rows sit one position behind the target's
         self.speculative_disable_by_batch_size = config.speculative_disable_by_batch_size
         self.speculative_min_acceptance = config.speculative_min_acceptance
         self.speculative_per_sequence = bool(config.speculative_per_sequence) and self.num_speculative_tokens > 0
@@ -175,7 +176,9 @@ class Scheduler:
             seq.num_scheduled_tokens = 0
             if is_prefill:
                 seq.num_cached_tokens += num_tokens
-                seq.num_draft_cached_tokens = seq.num_cached_tokens    # the draft model prefills alongside the target
+                # The draft model prefills alongside the target; an EAGLE-3 head's last row needs the
+                # token after the prompt, so it lags one position once the prompt is complete.
+                seq.num_draft_cached_tokens = seq.num_cached_tokens - (self.has_eagle_head and seq.num_cached_tokens == seq.num_tokens)
                 num_inflight = int(seq.num_cached_tokens == seq.num_tokens)    # samples once the prompt is done
             else:
                 num_inflight = num_tokens    # the newest token and the drafts: the most the step can add
@@ -219,8 +222,10 @@ class Scheduler:
                         # skips the draft model: its cache falls behind until the next step with drafts,
                         # and the blocks it lacks must not be hashed yet, or a prefix cache hit would
                         # read a stale draft KV.
+                        # An EAGLE-3 head scores the accepted tokens again next step, with the
+                        # target's hidden states: its cache ends where it did before this step.
                         lag = self.has_draft_model and len(new_token_ids) == num_drafts + 1    # every draft accepted
-                        seq.num_draft_cached_tokens = seq.num_cached_tokens - lag
+                        seq.num_draft_cached_tokens = start if self.has_eagle_head else seq.num_cached_tokens - lag
                 if speculative:
                     for j in range(1, num_drafts + 1):
                         proposed[j] += 1
@@ -235,7 +240,7 @@ class Scheduler:
             if seq.block_table:    # empty if preempted while this step was in flight
                 # Blocks both KV caches hold completely; the ones a lagging draft cache left for later are hashed
                 # once it catches up (hash_blocks scans back to them).
-                valid = start + num_tokens if is_prefill else min(seq.num_cached_tokens, seq.num_draft_cached_tokens)
+                valid = min(start + num_tokens, seq.num_draft_cached_tokens) if is_prefill else min(seq.num_cached_tokens, seq.num_draft_cached_tokens)
                 self.block_manager.hash_blocks(seq, start, valid - start)
             if stop:
                 if seq.status == SequenceStatus.RUNNING:

@@ -6,6 +6,7 @@ output repeats the prompt (where prompt lookup helps); the "chat" workload asks 
 """
 import argparse
 import glob
+import json
 import os
 import time
 
@@ -45,7 +46,7 @@ def main():
     parser.add_argument("--model", default=os.path.expanduser("~/huggingface/Qwen3-0.6B/"))
     parser.add_argument("--workload", choices=["edit", "chat", "mixed"], default="edit", help="mixed alternates edit and chat prompts")
     parser.add_argument("--num-speculative-tokens", type=int, default=0)
-    parser.add_argument("--speculative-model", default=None, help="draft model directory; n-gram drafts if omitted")
+    parser.add_argument("--speculative-model", default=None, help="draft model directory, or an EAGLE-3 head's (speculators format); n-gram drafts if omitted")
     parser.add_argument("--batch-size", type=int, default=1, help="requests per generate call")
     parser.add_argument("--num-prompts", type=int, default=8)
     parser.add_argument("--max-prompt-tokens", type=int, default=2048)
@@ -60,6 +61,7 @@ def main():
     parser.add_argument("--speculative-per-sequence", action="store_true", help="with --speculative-min-acceptance: a number of drafts per sequence, from its own acceptance rates")
     parser.add_argument("--speculative-ragged", choices=["varlen", "pad"], default="pad", help="how a batch with different numbers of drafts runs: varlen attention without CUDA graphs, or padded to the most drafts with the fixed-width kernel and the graphs")
     parser.add_argument("--profile", type=int, default=0, metavar="ROWS", help="after the warmup, run one batch under torch.profiler and print its top ROWS ops by CUDA time and by CPU time")
+    parser.add_argument("--save-outputs", default=None, metavar="FILE", help="write every request's token ids to FILE (JSON), to compare runs at T=0")
     args = parser.parse_args()
 
     llm = LLM(args.model, enforce_eager=args.enforce_eager, max_model_len=4096, async_scheduling=args.async_scheduling, speculative_disable_by_batch_size=args.speculative_disable_by_batch_size, num_speculative_tokens=args.num_speculative_tokens,
@@ -81,13 +83,18 @@ def main():
         print(averages.table(sort_by="self_cpu_time_total", row_limit=args.profile))
     scheduler.reset_stats()
     num_tokens = 0
+    token_ids = []
     t = time.perf_counter()
     for i in range(0, len(prompts), args.batch_size):
         outputs = llm.generate(prompts[i:i + args.batch_size], sampling_params, use_tqdm=False)
         num_tokens += sum(len(output["token_ids"]) for output in outputs)
+        token_ids += [output["token_ids"] for output in outputs]
     t = time.perf_counter() - t
+    if args.save_outputs:
+        with open(args.save_outputs, "w") as f:
+            json.dump(token_ids, f)
     acceptance = scheduler.num_accepted_tokens / scheduler.num_draft_tokens if scheduler.num_draft_tokens else 0.0
-    drafter = "none" if not args.num_speculative_tokens else "model" if args.speculative_model else "ngram"
+    drafter = "none" if not args.num_speculative_tokens else "eagle3" if scheduler.has_eagle_head else "model" if args.speculative_model else "ngram"
     # Per draft position: accepted / proposed (position j is only accepted when the j-1 before it were).
     # k_steps: decode steps by their number of drafts (adaptive speculation picks it per step); with
     # --speculative-per-sequence, sequence-steps. ragged: the share of decode steps whose sequences

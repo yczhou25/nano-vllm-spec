@@ -654,6 +654,52 @@ batch 8：两个采样器 GPU 时间 20.4 µs（62ddc96 是 51.0 / 55.7），墙
 - **端到端**：chat batch 32 每步 argmax 58.8 / 59.2 ms、采样 59.6 / 59.6（多 0.4–0.8；996212 是 0.6–0.7），batch 8 44.0 对 44.3，batch 1 39.0 对 39.0。吞吐采样 / argmax：chat batch 32 +5.4% / +6.1%、batch 8 +0.9%（这次接受率只涨 0.013）、batch 1 +2.9%、混合 +8.5%（接受率 0.569 对 0.548，步数 431 对 488）；T=0 对照 1120.5 对 1120.1 tok/s，token 和步数完全相同。
 - **这条线到此为止**：采样草稿的额外开销从 2.8 ms（244661，eager softmax）→ 2.0（278958）→ 0.6–1.6（281207）→ 0.4–0.8 ms（这次），占 60 ms 一步的 1%，而且剩下的能逐项对上账（4 次草稿采样 0.2 ms，拒绝采样器采样分支比 one-hot 多 0.25 ms，草稿 logits 读写）。再往下是把拒绝采样器的采样分支（728 µs，一步一次）也写成 Triton，最多再省 0.3 ms（0.5%），不值一次作业；真要省得把采样器放进 CUDA graph 把启动开销也抹掉，那是另一个工程。
 
+## EAGLE-3 草稿头（2026-11-10 加）
+
+草稿模型那条线的上限是 Qwen3-0.6B 和 8B 有多像（chat 接受率 0.42，每步还要跑 28 层）。EAGLE-3 用一个单层的"头"代替整个草稿模型：头看 target 自己的中间层隐状态来猜下一个 token，训练时就是对着 target 的输出学的，所以 chat 上的接受率高得多（RedHatAI 给的 HumanEval 平均接受长度 k=3 时 2.39、k=7 时 2.69），而且头只有一层。
+
+用的头：`RedHatAI/Qwen3-8B-speculator.eagle3`（Apache-2.0，speculators 格式，vLLM 用 `--speculative-config '{"method": "eagle3"}'` 直接加载的那个）。`config.json` 里要紧的几项：`transformer_layer_config` 是 Llama 风格的单层（hidden 4096、32 头 / 8 KV 头、head_dim 128、intermediate 12288、rms_norm_eps 1e-6、rope_theta 1e6、无 bias），`draft_vocab_size: 32000`（头只在 target 词表里最常用的 32000 个 token 上出 logits），`norm_before_residual: true`，`target_hidden_size: null`（和头一样是 4096）。权重 2.04 GB：`embed_tokens`（151936 × 4096，和 target 的一样）、`fc`（3·4096 → 4096，无 bias，把 target 三层的隐状态拼起来压成一层宽）、`layers.0.*`（`input_layernorm`、`hidden_norm`、`self_attn.{q,k,v,o}_proj`、`post_attention_layernorm`、`mlp.{gate,up,down}_proj`）、`norm`、`lm_head`（32000 × 4096）、两个 buffer `d2t`（草稿词表 → target 词表的偏移，long）和 `t2d`（target 词表里哪些 token 在草稿词表里，bool）。
+
+### 头是怎么算的
+
+- target 的第 2、18、33 层（vLLM 对 36 层的默认 `(2, n//2, n-3)`：这三层的输入，也就是 残差流 `hidden + residual`）拼成 (N, 3·4096)，过 `fc` 得到 (N, 4096) 的"融合隐状态"。
+- 头的一行：位置 p 上，输入是 target 在 p 的融合隐状态 和 token `t[p+1]` 的 embedding（`input_layernorm(embeds)` 和 `hidden_norm(hidden)` 各自归一化后拼成 8192 宽进注意力；`norm_before_residual` 为真时残差是归一化后的隐状态），一层 Llama 注意力 + MLP，`norm`，`lm_head` 出 32000 个 logits，预测 `t[p+2]`。也就是说头的行比 target 错一位：target 在位置 p 吃 `t[p]` 预测 `t[p+1]`，头在位置 p 吃 `t[p+1]`（和 target 对 p 的理解）预测 `t[p+2]`。
+- 接着往后猜时没有 target 的隐状态了，头就用自己上一行的输出（最后一层的残差流，`norm` 之前的那个）当下一行的隐状态输入，token 用刚猜的草稿；这就是 EAGLE 的"自回归"。
+- 注意力：Llama 风格，RoPE 的 theta 按 `transformer_layer_config` 取 1e6（speculators 自带的参考实现里没有传位置编码，vLLM 的 `llama_eagle3` 传了；头是 vLLM 的训练/验证栈出来的，照 vLLM 做）。
+
+### 接进 nano-vllm：隐状态 cache + 头的 KV 复用 target 的块表
+
+草稿模型版（见上）的骨架原样可用：`propose` 先补齐、再逐步猜；头的 KV cache 和 target 用同一张块表、同一组 slot（一层，每块 1 MB）。多出来的是头要 target 的隐状态，而且要的是"上一步算过的那些位置"的隐状态——不是这一步。两个办法：
+
+1. 每步把 target 算出的 (B, k+1, 4096) 融合隐状态留着，下一步按接受数 gather。但不带草稿的步（大 batch 关草稿、自适应 k）、异步调度、抢占后重新 prefill、前缀缓存命中，每一种都要单独处理"隐状态在哪"。
+2. **按 slot 存一份隐状态 cache**：target 每算一行，就把这一行的融合隐状态写到 KV 同一个 slot 上（`num_blocks × 256 × 4096` 的 bf16，每块 2 MB，对 8B 每块 37.7 MB 的 KV 是 5%）；头补齐时按补齐位置的 slot 读出来。KV 的记账（哪些位置有效、块什么时候能 hash、抢占后重建）对隐状态同样成立，上面四种情况一个都不用单独处理。写在 target 的 forward 里（`Qwen3Model` 收集三层的残差流后交给头的 `fc`，再按 context 里的 slot_mapping 写），所以在 CUDA graph 里。
+
+选 2。
+
+头的 KV 和草稿模型一样会"掉队"，记账复用 `seq.num_draft_cached_tokens`，但含义改成头的 KV 里有效的位置数 c：
+- 头的补齐行是位置 `c .. n-2`（n 是序列现在的 token 数），每行吃 `t[p+1]`，也就是序列最后 `m = n-1-c` 个 token——和草稿模型补齐时的 `tail` 一模一样，只是位置、slot 都往前错一位，再多 gather 一份隐状态；最后一行（位置 n-2，吃最新的 token `t[n-1]`，隐状态是 target 上一步对 n-2 的理解）出第一个草稿。
+- 猜第 i 个草稿（i ≥ 2）的行在位置 `n-3+i`，就是 target 给第 i-1 列的位置和 slot；context 长度比 target 的少一。
+- 一步带草稿的 decode 之后，c = 这步开始时的 n-1：接受的那几行头虽然在猜草稿时算过（用自己的隐状态），下一步还是用 target 的隐状态重算一遍（vLLM 也这么做：头训练时上下文全是 target 的隐状态，自己猜的那份只是权宜）。所以每步的补齐行数就是上一步接受的 token 数（1 .. k+1），不带草稿的步让它多掉几行，下次一起补。
+- 异步调度下 in-flight 的序列：c = in-flight 那步开始时的 n-1，在 GPU 上就是 `num_tokens - num_inflight - 1`。
+- prefill：头和 target 同一个 varlen context 跑一遍，id 整体左移一位；一个 chunk 的最后一行吃 prompt 里的下一个 token（还有 chunk 时它是知道的），prompt 已经完整时最后一行没有 token 可吃，填 0，它的 KV 在第一步 decode 的补齐里被重写（c = `num_cached_tokens - 1`）。前缀缓存命中的块里头的 KV 和隐状态都齐（hash 的条件还是 `min(num_cached_tokens, num_draft_cached_tokens)`）。
+- 草稿词表：头的 32000 个 logits 按 `d2t` 散到 target 词表宽的 `-inf` 张量里再交给 `DraftSampler` / `RejectionSampler`，两个采样器一行不改；q 在草稿词表之外是 0，`min(1, p/q)` 照样精确。argmax 也在散开后的张量上做（多读 151936 个数，batch 32 下 µs 级）。
+- CUDA graph：头的补齐步每序列 1 .. K+1 行（上一步接受了多少），每个行数一组 graph；掉队更多（不带草稿的步之后）就 eager 跑一次。隐状态经 graph 的输入缓冲区进头。
+- 没有改的：调度器、块管理器、拒绝采样器、自适应 k、按序列 k（pad 模式）；`speculative_model` 指向头的目录时自动按 `speculators_model_type: "eagle3"` 识别。
+
+### 正确性验证（CPU）
+
+模拟器里加一个假的头（`FakeEagleHead`）代替真头跑真的 `ModelRunner.propose`：
+- 假 target 每算一行，把这行的前缀哈希写进假的隐状态 cache（和它写 KV 的同一个 slot）；假头检查补齐行读到的隐状态就是位置 p 的前缀哈希（`tokens[:p+1]`），token 是 `t[p+1]`，位置、slot、context 长度都比草稿模型版少一；没 mask 的行写自己的 KV（另一个种子的哈希），读时逐位置核对；猜草稿的行检查隐状态是自己上一行的输出、token 是上一个草稿。
+- 其余检查（输出和参考逐 token 相同、块的 hash 时机、异步、抢占、前缀缓存、自适应 k、pad 模式的 ragged 批）和草稿模型版相同，模式 `eagle1` / `eagle4` / `async_eagle4` / `eagle4_adaptive` / `async_eagle4_adaptive` / `eagle4_acc` / `eagle4_perseq` / `async_eagle4_perseq`，100 个种子每种。
+- 模拟器抓到的两处：prefill 完整 prompt 后最后一行的头 KV 还没算（吃的 token 还没采出来），那一块不能在 prefill 这步就 hash（`Scheduler.postprocess` 的 prefill 分支原来按 target 的位置 hash）；异步调度下 in-flight 的步接受了几个 token CPU 不知道，补齐行数只能按它最多能加的算，和草稿模型版固定 2 行是一个道理。
+- 前缀缓存共享的块里，最后一个位置的头 KV 是哪条序列先 hash 这块、就用它的下一个 token 算的（块的 hash 只盖到块内的 token）：头的行比 target 错一位，这一位天生不在 hash 里。vLLM 的 EAGLE 也一样（草稿的 KV 用 target 的 slot，前缀命中时不重算）。它只影响草稿质量，不影响正确性；模拟器在块末位置只核对前缀哈希那一半（`FakeModel.head_kv_matches`）。
+- 变异体（`eagle` 模式各 12 个种子）：草稿行不错位、草稿步 context 不减一、补齐位置不减一、补齐 context 不减一、把归一化后的输出当隐状态喂回、隐状态从错的 slot 读、补齐少一行、异步 cached 差一、postprocess 沿用草稿模型的规则、prefill 后 c 不退一、prefill 按 target 的位置 hash——11 个全部被抓住。
+
+### 预期
+
+- 头一次 forward ≈ target 的 1/36 层 + 32000 宽的 lm_head + embedding 查表；k=4 时每步 1 次补齐 + 3 次单行，比 0.6B 草稿模型（28 层）便宜得多。
+- 接受率：RedHatAI 的数字换算过来，chat 上每步大约接受 1.4–1.7 个草稿（k=3–7），比 0.6B 的 0.42 × k 高；T=0 的输出和不带草稿的 8B 逐 token 相同（这是 GPU 测试的硬检查，头的好坏只影响速度）。
+
 ## 还没做的
 
 - GPU 上 Qwen3-8B 的吞吐对比：已做（见上）。原文：注意力的 `(B, k+1)` 形状、CUDA graph、编译后的拒绝采样器都只能在 GPU 上验证。A40 作业脚本 `cluster/nanovllm-a40.sbatch` 会跑 GPU 测试（贪心结果和 transformers 对比，同步、异步、投机三种模式），以及吞吐对比：随机 prompt（ngram 基本猜不中，看最坏情况）、代码修改任务（让模型给源文件加 docstring 后原样输出）和开放问答，batch 1/8/32，k=0/2/4。草稿模型的 GPU 测试（0.6B 给自己打草稿，接受率应接近 1）在 `tests/test_model_gpu.py` 的 `draft` 模式里。

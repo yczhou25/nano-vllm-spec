@@ -9,7 +9,9 @@ through block_tables and checks each value it reads. The next token is a functio
 so each request has a reference output that does not depend on batching, chunked prefill, prefix
 caching, preemption or speculation, and the engine must reproduce it exactly. A fake draft model
 does the same with its own KV cache and hash seed; its proposals only affect the acceptance rate,
-so the checks on its cache reads are what catch a stale draft KV.
+so the checks on its cache reads are what catch a stale draft KV. A fake EAGLE-3 head does the
+same one position behind the target, reading the target's hidden states (the prefix hashes the
+fake target writes to a hidden cache) at its catch-up rows and its own output at its draft rows.
 """
 import collections
 import hashlib
@@ -39,11 +41,12 @@ class Violation(AssertionError):
 
 
 def make_config(num_blocks, block_size, max_num_seqs, max_num_batched_tokens, eos=EOS, num_speculative_tokens=0, draft_model=False,
-                speculative_disable_by_batch_size=None, speculative_min_acceptance=None, speculative_per_sequence=False, speculative_ragged="pad"):
+                speculative_disable_by_batch_size=None, speculative_min_acceptance=None, speculative_per_sequence=False, speculative_ragged="pad", eagle=False):
     # Config itself requires a model directory and block sizes that are multiples of 256.
     return types.SimpleNamespace(num_kvcache_blocks=num_blocks, kvcache_block_size=block_size,
                                  max_num_seqs=max_num_seqs, max_num_batched_tokens=max_num_batched_tokens, eos=eos,
-                                 num_speculative_tokens=num_speculative_tokens, speculative_model="fake" if draft_model else None,
+                                 num_speculative_tokens=num_speculative_tokens, speculative_model="fake" if draft_model or eagle else None,
+                                 speculative_method="eagle3" if eagle else "model" if draft_model else None,
                                  speculative_disable_by_batch_size=speculative_disable_by_batch_size, speculative_min_acceptance=speculative_min_acceptance,
                                  speculative_per_sequence=speculative_per_sequence, speculative_ragged=speculative_ragged)
 
@@ -57,6 +60,7 @@ def make_runner(block_size, world_size=1, rank=0, num_speculative_tokens=0):
     runner.enforce_eager = True
     runner.num_speculative_tokens = num_speculative_tokens
     runner.draft_model = None
+    runner.eagle = False
     runner.draft_inputs = None
     runner.draft_layout = runner.sampler_layout = None
     runner.ragged_mode = "varlen"
@@ -69,14 +73,14 @@ def make_runner(block_size, world_size=1, rank=0, num_speculative_tokens=0):
 
 def make_engine(num_blocks, block_size, max_num_seqs, max_num_batched_tokens, async_scheduling=False, num_speculative_tokens=0, draft_model=False,
                 speculative_disable_by_batch_size=None, speculative_min_acceptance=None, speculative_per_sequence=False, speculative_ragged="pad",
-                speculative_sampled_drafts=True):
-    assert not (async_scheduling and num_speculative_tokens and not draft_model)
+                speculative_sampled_drafts=True, eagle=False):
+    assert not (async_scheduling and num_speculative_tokens and not (draft_model or eagle))
     engine = LLMEngine.__new__(LLMEngine)
     engine.scheduler = Scheduler(make_config(num_blocks, block_size, max_num_seqs, max_num_batched_tokens,
                                              num_speculative_tokens=num_speculative_tokens, draft_model=draft_model,
                                              speculative_disable_by_batch_size=speculative_disable_by_batch_size,
-                                             speculative_min_acceptance=speculative_min_acceptance, speculative_per_sequence=speculative_per_sequence))
-    engine.model_runner = FakeModel(engine.scheduler, block_size, num_blocks, num_speculative_tokens=num_speculative_tokens, draft_model=draft_model)
+                                             speculative_min_acceptance=speculative_min_acceptance, speculative_per_sequence=speculative_per_sequence, eagle=eagle))
+    engine.model_runner = FakeModel(engine.scheduler, block_size, num_blocks, num_speculative_tokens=num_speculative_tokens, draft_model=draft_model, eagle=eagle)
     engine.model_runner.runner.ragged_mode = speculative_ragged
     engine.model_runner.runner.sampled_drafts = speculative_sampled_drafts
     engine.async_scheduling = async_scheduling
@@ -90,6 +94,11 @@ def prefix_hashes(token_ids, h=TARGET_SEED):
         h = int.from_bytes(hashlib.blake2b(f"{h}:{t}".encode(), digest_size=8).digest(), "little")
         out.append(h)
     return out
+
+
+def fits_int64(h):
+    """A prefix hash cut to 62 bits, as the fake hidden cache (a torch.int64 tensor) stores it."""
+    return h & ((1 << 62) - 1)
 
 
 def next_token(token_ids, h):
@@ -242,17 +251,125 @@ class FakeDraftModel:
         return logits
 
 
+class FakeEagleHead:
+    """Stands in for Eagle3Head inside the real ModelRunner.propose. Its row at position p takes
+    the target's hidden state at p (read from the hidden cache, where the fake target wrote the
+    prefix hash of tokens[:p+1]) and token p + 1, so its catch-up rows end one position before
+    the newest token, and its context is one shorter than the target's; a draft row takes the
+    head's own output of the step before. Its KV at position p is (the draft hash of tokens[:p+1],
+    token p + 1): in a block shared through the prefix cache, the last position's row was computed
+    by whichever sequence hashed the block, with its own next token (the block's hash covers the
+    tokens up to it only), so only the hash part is checked there (FakeModel.head_kv_matches)."""
+
+    def __init__(self, model: "FakeModel"):
+        self.model = model
+        self.hidden_cache = model.hidden_cache
+        self.seqs = []
+        self.token_ids = []
+        self.drafts = []
+        self.num_drafts = []
+        self.last_hidden = []    # per sequence: the head's output hidden state of its last row
+
+    def begin(self, seqs, token_ids, num_drafts):
+        self.seqs = seqs
+        self.token_ids = [list(t) for t in token_ids]
+        self.drafts = [[] for _ in seqs]
+        self.num_drafts = list(num_drafts)
+        self.last_hidden = [None] * len(seqs)
+
+    def read_hidden_states(self, slots: torch.Tensor) -> torch.Tensor:    # as Eagle3Head.read_hidden_states
+        return self.hidden_cache[torch.where(slots >= 0, slots, self.hidden_cache.size(0) - 1).long()]
+
+    def __call__(self, input_ids: torch.Tensor, positions: torch.Tensor, hidden_states: torch.Tensor) -> torch.Tensor:
+        bs = self.model.block_size
+        c = get_context()
+        if c.is_prefill:
+            raise Violation("the head was called for prefill through propose")
+        if c.slot_mapping.dtype != torch.int32 or c.context_lens.dtype != torch.int32:
+            raise Violation(f"head step slot_mapping {c.slot_mapping.dtype} context_lens {c.context_lens.dtype}, not int32")
+        ids, pos, slots = input_ids.tolist(), positions.tolist(), c.slot_mapping.tolist()
+        hidden = hidden_states.view(-1).tolist()
+        context_lens, block_tables = c.context_lens.tolist(), c.block_tables.tolist()
+        q = len(ids) // len(self.seqs)
+        if len(ids) != q * len(self.seqs) or len(pos) != len(ids) or len(slots) != len(ids) or len(hidden) != len(ids):
+            raise Violation(f"head step inputs: {len(ids)} ids, {len(pos)} positions, {len(slots)} slots, {len(hidden)} hidden states for {len(self.seqs)} seqs")
+        outputs = []
+        step = max(map(len, self.drafts))
+        for i, seq in enumerate(self.seqs):
+            token_ids, drafts = self.token_ids[i], self.drafts[i]
+            n = len(token_ids)    # the sequence's tokens and its drafts so far: the head's rows end at position n - 2
+            rows = slice(i * q, (i + 1) * q)
+            step_ids, step_pos, step_slots, step_hidden = ids[rows], pos[rows], slots[rows], hidden[rows]
+            if len(drafts) >= self.num_drafts[i]:
+                # A dummy row (see FakeDraftModel): its KV masked, its context its own, its proposal dropped.
+                if any(s != -1 for s in step_slots):
+                    raise Violation(f"seq {seq.seq_id}: head step {step} writes slots {step_slots} after its {self.num_drafts[i]} drafts")
+                if context_lens[i] != n - 1 or any(p >= n for p in step_pos):
+                    raise Violation(f"seq {seq.seq_id}: dummy head step {step} positions {step_pos} context_len {context_lens[i]} for {n} tokens")
+                outputs.extend([[-1, 0]] * (q - 1) + [[0, 0]])
+                continue
+            truth = prefix_hashes(token_ids)
+            head_truth = prefix_hashes(token_ids, DRAFT_SEED)
+            if drafts:    # one row per sequence: the newest draft, at the position before the target scores it
+                expected_ids, expected_pos = [drafts[-1]], [n - 2]
+                if step_hidden[0] != self.last_hidden[i]:
+                    raise Violation(f"seq {seq.seq_id}: draft step {len(drafts)} hidden state {step_hidden[0]} is not the head's own output {self.last_hidden[i]}")
+            else:
+                # The catch-up rows are at the last q positions before the newest token, each with
+                # the token after it and the target's hidden state at it; the padded and the cached
+                # rows have a masked slot, and anything passes there.
+                positions_q = list(range(n - 1 - q, n - 1))
+                expected_pos = [max(0, p) for p in positions_q]
+                expected_ids = [token_ids[p + 1] if s != -1 else step_ids[j] for j, (p, s) in enumerate(zip(positions_q, step_slots))]
+                if step_slots[-1] == -1:
+                    raise Violation(f"seq {seq.seq_id}: the catch-up step does not write the head KV of the row before the newest token")
+                for j, (p, s) in enumerate(zip(positions_q, step_slots)):
+                    if s != -1 and step_hidden[j] != fits_int64(truth[p]):
+                        raise Violation(f"seq {seq.seq_id}: catch-up row at position {p} read hidden state {step_hidden[j]}, not the target's {fits_int64(truth[p])}")
+            if step_ids != expected_ids:
+                raise Violation(f"seq {seq.seq_id}: head step {len(drafts)} inputs {step_ids} != {expected_ids}")
+            if step_pos != expected_pos or context_lens[i] != n - 1:
+                raise Violation(f"seq {seq.seq_id}: head step {len(drafts)} positions {step_pos} context_len {context_lens[i]} for {n} tokens")
+            for j in range(q):
+                p = n - 1 - q + j
+                if step_slots[j] == -1:
+                    continue
+                if p < 0:
+                    raise Violation(f"seq {seq.seq_id}: a padding row of the catch-up step writes slot {step_slots[j]}")
+                self.model._write(self.model.draft_kv, seq, p, step_slots[j], (head_truth[p], token_ids[p + 1]))
+            for p in range(n - 1):
+                if not self.model.head_kv_matches(p, self.model.draft_kv[block_tables[i][p // bs] * bs + p % bs], (head_truth[p], token_ids[p + 1])):
+                    raise Violation(f"seq {seq.seq_id}: head step {len(drafts)} read wrong head KV at position {p} (context_len {n - 1})")
+            draft = draft_next_token(token_ids, truth[-1], head_truth[-1], self.model.draft_miss_mod(token_ids, len(drafts)))
+            drafts.append(draft)
+            token_ids.append(draft)
+            self.last_hidden[i] = fits_int64(head_truth[-1])
+            outputs.extend([[-1, 0]] * (q - 1) + [[draft, self.last_hidden[i]]])
+        return torch.tensor(outputs, dtype=torch.int64)    # a row: the token (-1 unless the sequence's last row), then the hidden state fed back
+
+    def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        return FakeDraftModel.compute_logits(self, hidden_states)
+
+
 class FakeModel:
     """Stands in for ModelRunner.call("run" / "run_async"). Like the GPU, it keeps the last step's
     sampled tokens, which the real prepare_decode reads for tokens still in flight."""
 
-    def __init__(self, scheduler: Scheduler, block_size: int, num_blocks: int, check_tp: bool = True, num_speculative_tokens: int = 0, draft_model: bool = False):
+    def __init__(self, scheduler: Scheduler, block_size: int, num_blocks: int, check_tp: bool = True, num_speculative_tokens: int = 0, draft_model: bool = False,
+                 eagle: bool = False):
         self.block_size = block_size
         self.kv = [None] * (num_blocks * block_size)
-        self.draft_kv = [None] * (num_blocks * block_size) if draft_model else None
+        self.draft_kv = [None] * (num_blocks * block_size) if draft_model or eagle else None    # the draft model's, or the head's
+        self.eagle = eagle
+        # The hidden cache an EAGLE-3 head reads (one "hidden" value per slot, plus the spare row
+        # masked slots write to): the target writes its prefix hash at every row it scores.
+        self.hidden_cache = torch.zeros(num_blocks * block_size + 1, 1, dtype=torch.int64) if eagle else None
         self.runner = make_runner(block_size, num_speculative_tokens=num_speculative_tokens)
         self.scheduler = scheduler
-        if draft_model:
+        if eagle:
+            self.runner.eagle = True
+            self.runner.draft_model = FakeEagleHead(self)
+        elif draft_model:
             self.runner.draft_model = FakeDraftModel(self)
         self.block_manager = scheduler.block_manager
         self.check_tp = check_tp
@@ -323,24 +440,36 @@ class FakeModel:
             if k_len != start + seq.num_scheduled_tokens:
                 raise Violation(f"seq {seq.seq_id}: seqlen_k {k_len} != {start} + {seq.num_scheduled_tokens}")
             truth = prefix_hashes(seq.token_ids[:k_len])
-            # The draft model's prefill uses the same inputs, slots and block tables.
-            caches = [(self.kv, truth, "")] + ([(self.draft_kv, prefix_hashes(seq.token_ids[:k_len], DRAFT_SEED), "draft ")] if self.draft_kv else [])
+            # The draft model's prefill uses the same inputs, slots and block tables. The head's row
+            # at position p takes token p + 1 (its KV: the draft hash of tokens[:p+2]), so the last
+            # row of a complete prompt has nothing valid (None), and the head reads the target's
+            # hidden states from the hidden cache, written here with the target's KV.
+            if self.eagle:
+                head_hashes = prefix_hashes(seq.token_ids[:k_len], DRAFT_SEED)
+                head_values = [(head_hashes[p], seq.token_ids[p + 1]) for p in range(min(k_len, seq.num_tokens - 1))]
+                caches = [(self.kv, truth, ""), (self.draft_kv, head_values, "head ")]
+                for j in range(q0, q1):
+                    if slots[j] != -1:
+                        self.hidden_cache[slots[j], 0] = fits_int64(truth[pos[j]])
+            else:
+                caches = [(self.kv, truth, "")] + ([(self.draft_kv, prefix_hashes(seq.token_ids[:k_len], DRAFT_SEED), "draft ")] if self.draft_kv else [])
             for kv, values, name in caches:
                 local = {}
                 for j in range(q0, q1):
                     p = pos[j]
                     if ids[j] != seq.token_ids[p]:
                         raise Violation(f"seq {seq.seq_id}: wrong input id at position {p}")
-                    self._write(kv, seq, p, slots[j], values[p])
-                    local[p] = values[p]
-                for p in range(k_len):
+                    self._write(kv, seq, p, slots[j], values[p] if p < len(values) else None)
+                    if p < len(values):
+                        local[p] = values[p]
+                for p in range(len(values)):    # every position with valid KV (the head's end one earlier, see above)
                     if block_tables is not None:
                         value = kv[block_tables[i][p // bs] * bs + p % bs]
                     elif p in local:
                         value = local[p]
                     else:
                         raise Violation(f"seq {seq.seq_id}: needs cached position {p} but got no block tables")
-                    if value != values[p]:
+                    if not (self.head_kv_matches(p, value, values[p]) if name == "head " else value == values[p]):
                         raise Violation(f"seq {seq.seq_id}: prefill read wrong {name}KV at position {p}")
             # compute_logits takes the hidden state at cu_seqlens_q[1:] - 1.
             outputs.append(next_token(seq.token_ids[:k_len], truth[pos[q1 - 1]]))
@@ -491,29 +620,37 @@ class FakeModel:
             # drafts (which caught up itself) only its newest token, and the last draft too when all
             # of them were accepted. Whether every lacking token is written shows when the fake draft
             # model reads its cache (FakeDraftModel.__call__); here the slots are checked against that.
+            # An EAGLE-3 head's rows sit one position behind: its catch-up rows are the positions
+            # c .. n-2 (c: the head's valid positions, after an in-flight step with drafts that
+            # step's starting n-1), each taking the token after it.
+            shift = int(self.eagle)
             catchup_ids, catchup_pos, catchup_slots = meta["draft_inputs"]
             m = len(catchup_ids[0])
             cached = []
             for i, seq in enumerate(seqs):
                 n_i = len(all_token_ids[i])
-                if seq.num_inflight > 1:
+                if seq.num_inflight > 1 and self.eagle:
+                    cached.append(n_i - len(self.last_outputs[seq.seq_id]) - 1)
+                elif seq.num_inflight > 1:
                     cached.append(n_i - 1 - (len(self.last_outputs[seq.seq_id]) == seq.num_inflight))
                 else:
                     cached.append(seq.num_draft_cached_tokens)
-            expected_m = max([2] + [len(all_token_ids[i]) - c for i, c in enumerate(cached) if qs[i] > 1])
+            # The CPU bounds what an in-flight step with drafts leaves the head lacking by all the tokens it could add.
+            expected_m = max([2 - shift] + [seqs[i].num_inflight if self.eagle and seqs[i].num_inflight > 1 else len(all_token_ids[i]) - c - shift
+                                            for i, c in enumerate(cached) if qs[i] > 1])
             if m != expected_m or any(len(row) != m for row in catchup_ids + catchup_pos + catchup_slots):
                 raise Violation(f"catch-up inputs for {m} tokens per sequence, expected {expected_m}: {catchup_ids} {catchup_pos} {catchup_slots}")
             for i, seq in enumerate(seqs):
                 n_i = len(all_token_ids[i])
-                if catchup_pos[i] != [max(0, p) for p in range(n_i - m, n_i)]:
+                if catchup_pos[i] != [max(0, p) for p in range(n_i - shift - m, n_i - shift)]:
                     raise Violation(f"seq {seq.seq_id}: catch-up positions {catchup_pos[i]} for {n_i} tokens")
                 for j, s in enumerate(catchup_slots[i]):
-                    p = n_i - m + j
+                    p = n_i - shift - m + j
                     if (s == -1) != (p < cached[i] or qs[i] == 1):
                         raise Violation(f"seq {seq.seq_id}: catch-up slot {s} at position {p} with {cached[i]} tokens in the draft cache and {qs[i] - 1} drafts")
                     if s == -1:
                         continue
-                    if s != block_tables[i][p // bs] * bs + p % bs or catchup_ids[i][j] != all_token_ids[i][p]:
+                    if s != block_tables[i][p // bs] * bs + p % bs or catchup_ids[i][j] != all_token_ids[i][p + shift]:
                         raise Violation(f"seq {seq.seq_id}: catch-up token {catchup_ids[i][j]} at position {p} with slot {s}")
             ids, all_drafts = self._propose(seqs, meta, all_token_ids, [seq_q - 1 for seq_q in qs], starts)
         else:
@@ -534,6 +671,8 @@ class FakeModel:
             truths.append(prefix_hashes(token_ids))
             for r in rows:
                 self._write(self.kv, seq, pos[r], slots[r], truths[i][pos[r]])
+                if self.eagle:    # the target's hidden state of every row it scores, drafts included
+                    self.hidden_cache[slots[r], 0] = fits_int64(truths[i][pos[r]])
             targets.append([next_token(token_ids[:p + 1], truths[i][p]) for p in range(n_i - 1, n_i + qs[i] - 1)])
         for i, seq in enumerate(seqs):
             for p in range(context_lens[i]):
@@ -581,16 +720,29 @@ class FakeModel:
                 draft_hashes = self.draft_prefix_hashes.setdefault(seq.seq_id, [])
                 if len(draft_hashes) < seq.num_tokens:
                     draft_hashes += prefix_hashes(seq.token_ids[len(draft_hashes):], draft_hashes[-1] if draft_hashes else DRAFT_SEED)
-                caches.append((self.draft_kv, draft_hashes, "draft "))
+                if self.eagle:
+                    caches.append((self.draft_kv, [(draft_hashes[p], seq.token_ids[p + 1]) for p in range(seq.num_tokens - 1)], "head "))
+                else:
+                    caches.append((self.draft_kv, draft_hashes, "draft "))
             for i, block_id in enumerate(seq.block_table):
                 block = self.block_manager.blocks[block_id]
                 if block.hash == -1 or (block_id, block.hash) in self.checked_blocks:
                     continue
                 for kv, values, name in caches:
                     for p in range(i * bs, (i + 1) * bs):
-                        if kv[block_id * bs + p % bs] != values[p]:
+                        value = kv[block_id * bs + p % bs]
+                        if not (self.head_kv_matches(p, value, values[p]) if name == "head " else value == values[p]):
                             raise Violation(f"seq {seq.seq_id}: hashed block {block_id} holds wrong {name}KV at position {p}")
                 self.checked_blocks.add((block_id, block.hash))
+
+    def head_kv_matches(self, p, value, expected):
+        """Whether the head's KV read at position p is right: (the draft hash of tokens[:p+1], token
+        p + 1), except at the last position of a block, where the row of a block shared through the
+        prefix cache was computed with the next token of the sequence that hashed the block."""
+        if value == expected:
+            return True
+        bs = self.block_size
+        return p % bs == bs - 1 and value is not None and value[0] == expected[0]
 
     def _write(self, kv, seq, p, slot, value):
         bs = self.block_size
@@ -724,7 +876,7 @@ def set_acceptance_switch(engine, rng):
     engine.model_runner.mixed_draft_quality = True
 
 
-def run_random_case(seed, async_scheduling=False, num_speculative_tokens=0, draft_model=False, adaptive=False, acceptance=False, per_sequence=False):
+def run_random_case(seed, async_scheduling=False, num_speculative_tokens=0, draft_model=False, adaptive=False, acceptance=False, per_sequence=False, eagle=False):
     rng = random.Random(seed)
     bs = rng.choice([2, 3, 4, 8])
     Sequence.block_size = bs
@@ -740,7 +892,7 @@ def run_random_case(seed, async_scheduling=False, num_speculative_tokens=0, draf
                          speculative_disable_by_batch_size=rng.randint(1, 3) if adaptive else None,
                          speculative_min_acceptance=rng.choice([0.2, 0.5, 0.8]) if acceptance else None, speculative_per_sequence=per_sequence,
                          speculative_ragged=rng.choice(["varlen", "pad"]) if per_sequence else "varlen",
-                         speculative_sampled_drafts=rng.random() < 0.7)
+                         speculative_sampled_drafts=rng.random() < 0.7, eagle=eagle)
     if acceptance:
         set_acceptance_switch(engine, rng)
     requests = random_requests(rng, bs, num_blocks * bs - num_speculative_tokens, pressure)
@@ -751,7 +903,7 @@ def run_random_case(seed, async_scheduling=False, num_speculative_tokens=0, draf
             raise Violation(f"request {i}: output {outputs.get(i)} != reference {expected}")
 
 
-def run_random_case_block_256(seed, async_scheduling=False, num_speculative_tokens=0, draft_model=False, adaptive=False, acceptance=False, per_sequence=False):
+def run_random_case_block_256(seed, async_scheduling=False, num_speculative_tokens=0, draft_model=False, adaptive=False, acceptance=False, per_sequence=False, eagle=False):
     """Same checks with the default block size and realistic token budgets."""
     rng = random.Random(seed)
     bs = 256
@@ -763,7 +915,7 @@ def run_random_case_block_256(seed, async_scheduling=False, num_speculative_toke
                          speculative_disable_by_batch_size=rng.randint(1, 3) if adaptive else None,
                          speculative_min_acceptance=rng.choice([0.2, 0.5, 0.8]) if acceptance else None, speculative_per_sequence=per_sequence,
                          speculative_ragged=rng.choice(["varlen", "pad"]) if per_sequence else "varlen",
-                         speculative_sampled_drafts=rng.random() < 0.7)
+                         speculative_sampled_drafts=rng.random() < 0.7, eagle=eagle)
     if acceptance:
         set_acceptance_switch(engine, rng)
     base = [rng.randrange(1, VOCAB) for _ in range(1200)]

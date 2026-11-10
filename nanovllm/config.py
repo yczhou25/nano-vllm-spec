@@ -1,3 +1,4 @@
+import json
 import os
 from dataclasses import dataclass
 from transformers import AutoConfig
@@ -14,7 +15,8 @@ class Config:
     enforce_eager: bool = False
     async_scheduling: bool = False
     num_speculative_tokens: int = 0
-    speculative_model: str | None = None    # a smaller model that drafts the speculative tokens; n-gram lookup if None
+    speculative_model: str | None = None    # a smaller model that drafts the speculative tokens, or an EAGLE-3 head (speculators format) for the target; n-gram lookup if None
+    speculative_method: str | None = None   # what speculative_model is, read from its config: "model" or "eagle3"
     speculative_disable_by_batch_size: int | None = None    # decode without drafts while more sequences than this are running
     speculative_min_acceptance: float | None = None    # decode without drafts while the measured draft acceptance rate is below this
     speculative_per_sequence: bool = False    # with speculative_min_acceptance: a number of drafts per sequence, from its own acceptance rates
@@ -42,6 +44,15 @@ class Config:
         if self.speculative_model is not None:
             assert os.path.isdir(self.speculative_model)
             assert self.num_speculative_tokens > 0, "speculative_model needs num_speculative_tokens"
-            self.draft_hf_config = AutoConfig.from_pretrained(self.speculative_model)
+            with open(os.path.join(self.speculative_model, "config.json")) as f:
+                speculative_config = json.load(f)
+            if speculative_config.get("speculators_model_type") == "eagle3":
+                from nanovllm.models.eagle3 import Eagle3Config
+                self.speculative_method = "eagle3"
+                self.draft_hf_config = Eagle3Config(self.speculative_model, self.hf_config)
+                assert self.draft_hf_config.target_hidden_size == self.hf_config.hidden_size, "the EAGLE-3 head was trained for a target of another width"
+            else:
+                self.speculative_method = "model"
+                self.draft_hf_config = AutoConfig.from_pretrained(self.speculative_model)
             assert self.draft_hf_config.vocab_size == self.hf_config.vocab_size, "the draft model must share the target's tokenizer"
             self.max_model_len = min(self.max_model_len, self.draft_hf_config.max_position_embeddings)

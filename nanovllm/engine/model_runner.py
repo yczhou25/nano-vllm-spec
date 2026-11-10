@@ -7,6 +7,7 @@ from multiprocessing.shared_memory import SharedMemory
 from nanovllm.config import Config
 from nanovllm.engine.sequence import Sequence
 from nanovllm.models.qwen3 import Qwen3ForCausalLM
+from nanovllm.models.eagle3 import Eagle3Head
 from nanovllm.layers.sampler import DraftSampler, RejectionSampler, Sampler, accepted_token_ids
 from nanovllm.utils.context import set_context, get_context, restore_context, reset_context
 from nanovllm.utils.loader import load_model
@@ -41,6 +42,7 @@ class ModelRunner:
         self.event = event
         self.last_token_ids = None    # last run_async step's sampled tokens, still on the GPU (see AsyncOutput)
         self.draft_model = None
+        self.eagle = config.speculative_method == "eagle3"    # the draft model is an EAGLE-3 head (models/eagle3.py), drafting from the target's hidden states
         self.draft_inputs = None      # the draft model's decode inputs, prepared with the target's
         self.ragged_mode = config.speculative_ragged    # how a ragged batch runs: "varlen" or "pad" (see prepare_decode)
         self.sampled_drafts = config.speculative_sampled_drafts    # a draft model samples its drafts (see propose), with the distributions kept for the sampler
@@ -61,8 +63,11 @@ class ModelRunner:
             self.model = Qwen3ForCausalLM(hf_config)
             load_model(self.model, config.model)
             if config.speculative_model is not None:
-                self.draft_model = Qwen3ForCausalLM(config.draft_hf_config)
+                self.draft_model = Eagle3Head(config.draft_hf_config) if self.eagle else Qwen3ForCausalLM(config.draft_hf_config)
                 load_model(self.draft_model, config.speculative_model)
+                if self.eagle:    # the target hands the head its aux layers' inputs every forward
+                    self.model.model.aux_hidden_state_layers = config.draft_hf_config.aux_hidden_state_layers
+                    self.model.model.aux_hidden_state_hook = self.draft_model.store_hidden_states
             self.sampler = Sampler()
             self.rejection_sampler = RejectionSampler()
             self.draft_sampler = DraftSampler()
@@ -226,11 +231,16 @@ class ModelRunner:
         block_bytes = self.kv_cache_block_bytes(config.hf_config)
         if self.draft_model is not None:
             block_bytes += self.kv_cache_block_bytes(config.draft_hf_config)
+            if self.eagle:    # and the hidden cache: the target's fused hidden state of every position (see Eagle3Head)
+                block_bytes += self.block_size * config.draft_hf_config.hidden_size * config.draft_hf_config.dtype.itemsize
         config.num_kvcache_blocks = int(total * config.gpu_memory_utilization - used - peak + current) // block_bytes
         assert config.num_kvcache_blocks > 0
         self.kv_cache = self.bind_kv_cache(self.model, config.hf_config, config.num_kvcache_blocks)
         if self.draft_model is not None:
             self.draft_kv_cache = self.bind_kv_cache(self.draft_model, config.draft_hf_config, config.num_kvcache_blocks)
+            if self.eagle:
+                self.draft_model.hidden_cache = torch.zeros(config.num_kvcache_blocks * self.block_size + 1, config.draft_hf_config.hidden_size,
+                                                            dtype=config.draft_hf_config.dtype, device="cuda")
 
     def prepare_block_tables(self, seqs: list[Sequence]):
         max_len = max(len(seq.block_table) for seq in seqs)
@@ -427,7 +437,15 @@ class ModelRunner:
             # A sequence without drafts in this step is left out (every slot masked): its cache
             # falls behind as in a step without drafts, and the scheduler counts it so.
             cached = [seq.num_draft_cached_tokens for seq in seqs]
-            m = max([2] + [2 if seq.num_inflight > 1 else len(seq) + seq.num_inflight - c for seq, c, num in zip(seqs, cached, num_drafts) if num])
+            if self.eagle:
+                # The head's KV cache holds positions 0 .. c-1 and lacks the rows at c .. n-2, each
+                # taking the token after its position: the last n-1-c tokens, read with the
+                # target's hidden states at c .. n-2 from the hidden cache (see Eagle3Head). An
+                # in-flight step with drafts leaves c at its own n-1, so its rows are the tokens it
+                # accepted, at most all it could add.
+                m = max([1] + [seq.num_inflight if seq.num_inflight > 1 else len(seq) + seq.num_inflight - c - 1 for seq, c, num in zip(seqs, cached, num_drafts) if num])
+            else:
+                m = max([2] + [2 if seq.num_inflight > 1 else len(seq) + seq.num_inflight - c for seq, c, num in zip(seqs, cached, num_drafts) if num])
             tail = to_cuda([([0] * m + seq.token_ids[c:])[-m:] for seq, c in zip(seqs, cached)], torch.int64)
             cached = to_cuda(cached, torch.int64)
             if output is not None:
@@ -435,10 +453,13 @@ class ModelRunner:
                 # the newest token, and the last draft too when all of them were accepted.
                 spec_inflight = to_cuda([seq.num_inflight > 1 for seq in seqs], torch.bool)    # in flight: the newest token and its drafts
                 max_inflight = to_cuda([seq.num_inflight for seq in seqs], torch.int64)
-                cached = torch.where(spec_inflight, num_tokens - 1 - (num_inflight == max_inflight).long(), cached)
+                if self.eagle:    # the head's rows end one position before the newest token of the step before
+                    cached = torch.where(spec_inflight, num_tokens - num_inflight - 1, cached)
+                else:
+                    cached = torch.where(spec_inflight, num_tokens - 1 - (num_inflight == max_inflight).long(), cached)
                 tokens = torch.cat([tail, output.clamp_min(0)], dim=1)
                 tail = tokens.gather(1, num_inflight.unsqueeze(1) + torch.arange(m, device=tokens.device))
-            catchup_positions = (num_tokens - m).unsqueeze(1) + torch.arange(m, device=num_tokens.device)
+            catchup_positions = (num_tokens - m - int(self.eagle)).unsqueeze(1) + torch.arange(m, device=num_tokens.device)
             padded_positions = catchup_positions.clamp_min(0)
             catchup_slots = block_tables.gather(1, padded_positions // block_size) * block_size + padded_positions % block_size
             drafted = to_cuda([num > 0 for num in num_drafts], torch.bool)
@@ -480,12 +501,14 @@ class ModelRunner:
         return temperatures if temperatures is not None and any(seq.temperature > 0 for seq in seqs) else None
 
     @torch.inference_mode()
-    def forward(self, model: Qwen3ForCausalLM, graphs: dict | None, outputs: torch.Tensor | None, input_ids: torch.Tensor, positions: torch.Tensor, is_prefill: bool):
+    def forward(self, model: Qwen3ForCausalLM | Eagle3Head, graphs: dict | None, outputs: torch.Tensor | None, input_ids: torch.Tensor, positions: torch.Tensor, is_prefill: bool,
+                hidden_states: torch.Tensor | None = None):
         """Hidden states of input_ids, through a captured CUDA graph when there is one for this
-        decode batch size (none during warmup, or with enforce_eager)."""
+        decode batch size (none during warmup, or with enforce_eager). An EAGLE-3 head takes its
+        rows' input hidden states too."""
         context = get_context()
         if is_prefill or graphs is None or context.context_lens.size(0) > 512:
-            return model(input_ids, positions)
+            return model(input_ids, positions) if hidden_states is None else model(input_ids, positions, hidden_states)
         else:
             bs = context.context_lens.size(0)
             n = input_ids.size(0)    # bs * tokens per sequence
@@ -493,6 +516,8 @@ class ModelRunner:
             graph_vars = self.graph_vars
             graph_vars["input_ids"][:n] = input_ids
             graph_vars["positions"][:n] = positions
+            if hidden_states is not None:
+                graph_vars["draft_hidden"][:n] = hidden_states
             graph_vars["slot_mapping"].fill_(-1)
             graph_vars["slot_mapping"][:n] = context.slot_mapping
             graph_vars["context_lens"].zero_()
@@ -519,7 +544,12 @@ class ModelRunner:
         (exact speculative sampling); otherwise the drafts are the draft's argmax, one-hot
         proposals the sampler accepts with p. The first step scores the
         tokens the draft KV cache lacks (see prepare_decode_with_draft_model) and proposes from the
-        newest token's logits; each later step scores the draft just proposed."""
+        newest token's logits; each later step scores the draft just proposed.
+
+        An EAGLE-3 head (models/eagle3.py) runs the same steps one position behind the target:
+        its catch-up rows take the target's hidden states from the hidden cache and end at the
+        position before the newest token, and the row that scores draft i sits where the target
+        scores draft i - 1, taking the head's own output of the step before as its hidden state."""
         context = get_context()    # the target's
         context_lens, block_tables = context.context_lens, context.block_tables
         tokens, catchup_positions, catchup_slots = self.draft_inputs
@@ -530,25 +560,33 @@ class ModelRunner:
         k = token_index.size(1) - 1
         slot_mapping = context.slot_mapping
         sampling = self.sampled_drafts and temperatures is not None and self.rank == 0
+        eagle = self.eagle
+        shift = int(eagle)    # the head's rows sit one position behind the target's
+        input_hidden_states = None    # a head's: the target's at the catch-up rows, then its own output
         self.draft_logits = self.draft_log_norms = None
         for i in range(k):
             if i == 0:
                 q, step_positions, step_slots = m, catchup_positions, catchup_slots
-                step_context_lens = context_lens - k if num_drafts is None else context_lens - num_drafts
+                step_context_lens = (context_lens - k if num_drafts is None else context_lens - num_drafts) - shift
+                if eagle:
+                    input_hidden_states = self.draft_model.read_hidden_states(step_slots).view(bs * m, -1)
             else:    # the newest draft, at the position the target scores it
-                rows = token_index[:, i]
+                rows = token_index[:, i - shift]
                 q, step_positions, step_slots = 1, positions[rows], slot_mapping[rows]
-                step_context_lens = context_lens - k + i
+                step_context_lens = context_lens - k + i - shift
                 if num_drafts is not None:
                     # A sequence with fewer drafts scores a dummy row (its last one again, its KV
                     # masked) at its own context length, and its proposal goes to the scratch row.
                     step_slots = torch.where(num_drafts > i, step_slots, -1)
-                    step_context_lens = context_lens - num_drafts + torch.minimum(num_drafts, torch.tensor(i, dtype=torch.int32, device=num_drafts.device))
+                    step_context_lens = context_lens - num_drafts + torch.minimum(num_drafts, torch.tensor(i, dtype=torch.int32, device=num_drafts.device)) - shift
             set_context(False, slot_mapping=step_slots.reshape(-1), context_lens=step_context_lens, block_tables=block_tables)
-            # Graphs exist for 1 and 2 tokens per sequence; a longer catch-up, after steps without drafts, runs eagerly.
+            # Graphs exist for 1 and 2 tokens per sequence (a head: 1 to K + 1); a longer catch-up, after steps without drafts, runs eagerly.
             graphs, outputs = (self.draft_graphs.get(q), self.graph_vars["draft_outputs"]) if self.draft_graphs is not None else (None, None)
-            hidden_states = self.forward(self.draft_model, graphs, outputs, tokens.reshape(-1), step_positions.reshape(-1), False)
-            logits = self.draft_model.compute_logits(hidden_states[q - 1::q])
+            hidden_states = self.forward(self.draft_model, graphs, outputs, tokens.reshape(-1), step_positions.reshape(-1), False, input_hidden_states)
+            last_rows = hidden_states[q - 1::q]
+            if eagle:    # the normed output the logits come from, and the residual stream the next step feeds back
+                last_rows, input_hidden_states = (t.contiguous() for t in last_rows.chunk(2, dim=-1))
+            logits = self.draft_model.compute_logits(last_rows)
             if sampling:
                 tokens, log_norms = self.draft_sampler(logits, temperatures)
                 if i == 0:
@@ -574,9 +612,30 @@ class ModelRunner:
             input_ids = self.propose(input_ids, positions, temperatures)
         n = input_ids.size(0) if get_context().cu_seqlens_q is None else sum(seq.num_scheduled_tokens for seq in seqs)    # a varlen ragged batch's inputs end with a scratch row
         logits = self.run_model(input_ids[:n], positions[:n], is_prefill)
-        if self.draft_model is not None and is_prefill:
-            self.forward(self.draft_model, None, None, input_ids, positions, True)    # fills the draft KV cache
+        if self.draft_model is not None and is_prefill:    # fills the draft KV cache
+            if self.eagle:
+                self.prefill_head(seqs, input_ids, positions)
+            else:
+                self.forward(self.draft_model, None, None, input_ids, positions, True)
         return input_ids, logits, k
+
+    def prefill_head(self, seqs: list[Sequence], input_ids: torch.Tensor, positions: torch.Tensor):
+        """The EAGLE-3 head's prefill, on the target's context: its row at position p takes the
+        target's hidden state at p (just written to the hidden cache) and the token after p, so
+        the input ids shift left by one within each sequence, and a chunk's last row takes the
+        prompt's next token, or 0 when the prompt ends there (the first decode step scores that
+        row again; see Scheduler.commit)."""
+        head = self.draft_model
+        context = get_context()
+        if head.hidden_cache.numel():
+            hidden_states = head.read_hidden_states(context.slot_mapping)
+            next_tokens = [seq.token_ids[end] if (end := seq.num_cached_tokens + seq.num_scheduled_tokens) < seq.num_tokens else 0 for seq in seqs]
+            next_tokens = torch.tensor(next_tokens, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
+            input_ids = input_ids.roll(-1)
+            input_ids[(context.cu_seqlens_q[1:] - 1).long()] = next_tokens
+        else:    # warmup: no caches yet, the forward is only compiled
+            hidden_states = torch.zeros(input_ids.size(0), head.config.hidden_size, dtype=head.config.dtype, device=input_ids.device)
+        self.forward(head, None, None, input_ids, positions, True, hidden_states)
 
     def sample(self, seqs: list[Sequence], input_ids: torch.Tensor, logits: torch.Tensor, temperatures: torch.Tensor, k: int) -> torch.Tensor:
         """The step's sampled tokens: one per sequence without drafts, else RejectionSampler's row
@@ -625,7 +684,7 @@ class ModelRunner:
         return AsyncOutput(token_ids) if self.rank == 0 else None
 
     @torch.inference_mode()
-    def capture_graphs(self, model: Qwen3ForCausalLM, outputs: torch.Tensor, q: int) -> dict[int, torch.cuda.CUDAGraph]:
+    def capture_graphs(self, model: Qwen3ForCausalLM | Eagle3Head, outputs: torch.Tensor, q: int, with_hidden_states: bool = False) -> dict[int, torch.cuda.CUDAGraph]:
         """One graph per batch size for decode steps of q tokens per sequence. All graphs share
         the input buffers in graph_vars and the memory pool; they are replayed one at a time."""
         graph_vars = self.graph_vars
@@ -634,10 +693,11 @@ class ModelRunner:
         for bs in reversed(self.graph_bs):
             graph = torch.cuda.CUDAGraph()
             n = bs * q
+            inputs = (input_ids[:n], positions[:n]) + ((graph_vars["draft_hidden"][:n],) if with_hidden_states else ())
             set_context(False, slot_mapping=graph_vars["slot_mapping"][:n], context_lens=graph_vars["context_lens"][:bs], block_tables=graph_vars["block_tables"][:bs])
-            outputs[:n] = model(input_ids[:n], positions[:n])    # warmup
+            outputs[:n] = model(*inputs)    # warmup
             with torch.cuda.graph(graph, self.graph_pool):
-                outputs[:n] = model(input_ids[:n], positions[:n])    # capture
+                outputs[:n] = model(*inputs)    # capture
             if self.graph_pool is None:
                 self.graph_pool = graph.pool()
             graphs[bs] = graph
@@ -667,7 +727,15 @@ class ModelRunner:
         for q in self.decode_query_lengths():
             self.graphs[q] = self.capture_graphs(self.model, self.graph_vars["outputs"], q)
         self.draft_graphs = {}
-        if self.draft_model is not None:
+        if self.draft_model is not None and self.eagle:
+            # The head's catch-up step scores as many rows per sequence as the step before
+            # accepted, 1 to K + 1 (more after steps without drafts: eager), the others one.
+            hidden_size = config.draft_hf_config.hidden_size
+            self.graph_vars["draft_hidden"] = torch.zeros(max_bs * q, hidden_size, dtype=config.draft_hf_config.dtype, device="cuda")
+            self.graph_vars["draft_outputs"] = torch.zeros(max_bs * q, 2 * hidden_size, dtype=config.draft_hf_config.dtype, device="cuda")
+            for rows in range(q, 0, -1):
+                self.draft_graphs[rows] = self.capture_graphs(self.draft_model, self.graph_vars["draft_outputs"], rows, with_hidden_states=True)
+        elif self.draft_model is not None:
             # The first draft step scores two tokens per sequence, the others one (see propose).
             self.graph_vars["draft_outputs"] = torch.zeros(max_bs * 2, config.draft_hf_config.hidden_size, dtype=config.draft_hf_config.dtype, device="cuda")
             for q in (2, 1):

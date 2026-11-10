@@ -169,6 +169,10 @@ class Qwen3Model(nn.Module):
         self.embed_tokens = VocabParallelEmbedding(config.vocab_size, config.hidden_size)
         self.layers = nn.ModuleList([Qwen3DecoderLayer(config) for _ in range(config.num_hidden_layers)])
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        # An EAGLE-3 head (models/eagle3.py) reads the inputs of a few layers: their indices, and
+        # the head's method that takes them concatenated (ModelRunner sets both).
+        self.aux_hidden_state_layers: tuple[int, ...] = ()
+        self.aux_hidden_state_hook = None
 
     def forward(
         self,
@@ -177,9 +181,14 @@ class Qwen3Model(nn.Module):
     ) -> torch.Tensor:
         hidden_states = self.embed_tokens(input_ids)
         residual = None
-        for layer in self.layers:
+        aux_hidden_states = []
+        for i, layer in enumerate(self.layers):
+            if i in self.aux_hidden_state_layers:    # the residual stream entering layer i
+                aux_hidden_states.append(hidden_states if residual is None else hidden_states + residual)
             hidden_states, residual = layer(positions, hidden_states, residual)
         hidden_states, _ = self.norm(hidden_states, residual)
+        if aux_hidden_states:
+            self.aux_hidden_state_hook(torch.cat(aux_hidden_states, dim=-1))
         return hidden_states
 
 

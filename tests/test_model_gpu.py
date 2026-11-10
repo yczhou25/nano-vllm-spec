@@ -17,7 +17,13 @@ pytestmark = pytest.mark.gpu
 MODEL = os.path.expanduser(os.environ.get("NANOVLLM_TEST_MODEL", "~/huggingface/Qwen3-0.6B/"))
 # The draft model defaults to the target itself, whose greedy drafts should nearly all be accepted.
 DRAFT_MODEL = os.path.expanduser(os.environ.get("NANOVLLM_TEST_DRAFT_MODEL", MODEL))
+# An EAGLE-3 head for the test model (none: its modes are skipped). The head's rows only affect
+# the acceptance rate, so these modes are the same checks as the draft model's.
+EAGLE_MODEL = os.environ.get("NANOVLLM_TEST_EAGLE_MODEL")
 LOGIT_TOL = float(os.environ.get("NANOVLLM_TEST_LOGIT_TOL", "0.5"))
+# A large test model needs the GPU shared with the reference: less of it for the engine, and the reference in bf16.
+GPU_MEMORY_UTILIZATION = float(os.environ.get("NANOVLLM_TEST_GPU_MEMORY_UTILIZATION", "0.5"))
+REFERENCE_DTYPE = getattr(torch, os.environ.get("NANOVLLM_TEST_REFERENCE_DTYPE", "float32"))
 MAX_TOKENS = 64
 
 QUESTIONS = [
@@ -52,6 +58,10 @@ ENGINE_OPTIONS = {
     # The same with ragged batches padded to the fixed width (dummy rows, CUDA graphs) instead of varlen attention.
     "spec_per_sequence_varlen": {"num_speculative_tokens": 4, "speculative_min_acceptance": 0.5, "speculative_per_sequence": True, "speculative_ragged": "varlen"},
     "async_draft_per_sequence_varlen": {"async_scheduling": True, "num_speculative_tokens": 4, "speculative_model": DRAFT_MODEL, "speculative_min_acceptance": 0.9, "speculative_per_sequence": True, "speculative_ragged": "varlen"},
+    # An EAGLE-3 head drafting for the target (NANOVLLM_TEST_EAGLE_MODEL), with and without async scheduling and adaptive k.
+    "eagle": {"num_speculative_tokens": 4, "speculative_model": EAGLE_MODEL},
+    "async_eagle": {"async_scheduling": True, "num_speculative_tokens": 4, "speculative_model": EAGLE_MODEL},
+    "eagle_acceptance": {"num_speculative_tokens": 4, "speculative_model": EAGLE_MODEL, "speculative_min_acceptance": 0.5},
 }
 
 
@@ -59,9 +69,11 @@ ENGINE_OPTIONS = {
 def llm(request):
     if not os.path.isdir(MODEL):
         pytest.skip(f"no model at {MODEL}; set NANOVLLM_TEST_MODEL")
+    if "eagle" in request.param and not EAGLE_MODEL:
+        pytest.skip("no EAGLE-3 head; set NANOVLLM_TEST_EAGLE_MODEL")
     from nanovllm import LLM
     # A small token budget sends the long prompts through chunked prefill.
-    engine = LLM(MODEL, max_model_len=4096, max_num_batched_tokens=1024, gpu_memory_utilization=0.5,
+    engine = LLM(MODEL, max_model_len=4096, max_num_batched_tokens=1024, gpu_memory_utilization=GPU_MEMORY_UTILIZATION,
                  **ENGINE_OPTIONS[request.param])
     yield engine
     engine.exit()
@@ -71,7 +83,7 @@ def llm(request):
 @pytest.fixture(scope="module")
 def reference(llm):
     from transformers import AutoModelForCausalLM
-    return AutoModelForCausalLM.from_pretrained(MODEL).float().cuda().eval()
+    return AutoModelForCausalLM.from_pretrained(MODEL, dtype=REFERENCE_DTYPE).cuda().eval()
 
 
 def chat(tokenizer, text, thinking=True):
@@ -102,7 +114,7 @@ def test_greedy_matches_reference(llm, reference):
     for prompt, completion in zip(prompts, generate(llm, prompts)):
         assert completion
         check(reference, prompt, completion)
-    if scheduler.has_draft_model and scheduler.num_draft_tokens and os.path.samefile(DRAFT_MODEL, MODEL):
+    if scheduler.has_draft_model and not scheduler.has_eagle_head and scheduler.num_draft_tokens and os.path.samefile(DRAFT_MODEL, MODEL):
         # The target drafting for itself: every draft matches the greedy token unless bf16 noise
         # between the draft and verification passes flips a near-tie.
         assert scheduler.num_accepted_tokens / scheduler.num_draft_tokens > 0.8
@@ -149,7 +161,7 @@ def test_sampled_drafts_from_the_target_itself_are_nearly_all_accepted(llm):
     # Argmax drafts are accepted with p(argmax), the model's confidence, far below that.
     from nanovllm import SamplingParams
     scheduler = llm.scheduler
-    if not scheduler.has_draft_model or not os.path.samefile(DRAFT_MODEL, MODEL) or scheduler.speculative_min_acceptance is not None or scheduler.speculative_disable_by_batch_size is not None:
+    if not scheduler.has_draft_model or scheduler.has_eagle_head or not os.path.samefile(DRAFT_MODEL, MODEL) or scheduler.speculative_min_acceptance is not None or scheduler.speculative_disable_by_batch_size is not None:
         pytest.skip("a draft model drafting for itself with every draft only")
     prompts = [chat(llm.tokenizer, q) for q in QUESTIONS]
     scheduler.reset_stats()
