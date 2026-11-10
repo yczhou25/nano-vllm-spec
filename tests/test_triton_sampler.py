@@ -87,10 +87,14 @@ def test_samplers_dispatch_to_the_kernels_on_the_gpu_and_torch_elsewhere():
     expected_tokens, torch_norms = DraftSampler().torch_forward(logits, temperatures)
     assert torch.equal(tokens[temperatures == 0], expected_tokens[temperatures == 0])
     # Both paths use approximate exp/log/division on the GPU (Triton's div.full and ex2/lg2.approx,
-    # Inductor's libdevice); compare each with a float64 reference rather than with each other.
+    # Inductor's libdevice); compare each with a float64 reference rather than with each other. Both
+    # are within 1e-7 relative (bench_sampler.py --check, A40 job 1275031), except that Inductor's
+    # compiled log-sum-exp overflows to inf on the T=0 rows (logits / 1e-10 ~ 1e11), where no log-norm
+    # is ever read: the kernel's value there is finite and checked, the torch path's is not.
     reference = torch.logsumexp(logits.double() / temperatures.double().clamp_min(1e-10).unsqueeze(1), dim=-1)
     assert torch.allclose(log_norms.double(), reference, rtol=1e-5, atol=1e-3), (log_norms - reference).abs().max()
-    assert torch.allclose(torch_norms.double(), reference, rtol=1e-5, atol=1e-3), (torch_norms - reference).abs().max()
+    sampled = temperatures > 0
+    assert torch.allclose(torch_norms.double()[sampled], reference[sampled], rtol=1e-5, atol=1e-3), (torch_norms - reference).abs()[sampled].max()
     sampled = Sampler()(logits, temperatures)
     assert sampled.shape == (6,) and sampled.dtype == torch.int64
     assert torch.equal(sampled[temperatures == 0], logits.argmax(dim=-1)[temperatures == 0])

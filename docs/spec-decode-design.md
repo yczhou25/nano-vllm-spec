@@ -639,12 +639,27 @@ batch 8：两个采样器 GPU 时间 20.4 µs（62ddc96 是 51.0 / 55.7），墙
 - **第一级 kernel 还不到带宽**：batch 32 读 9.7 MB 用 60.6 µs 是 160 GB/s，而且 1 / 8 / 32 行是 4.0 / 17.5 / 60.6 µs，和 program 数成正比，是指令吞吐而不是访存或延迟在卡。看 Triton 的 `random.py`：`tl.rand` 调一次 Philox（10 轮）产出 4 个 32 位数却只留 1 个，一个 1024 宽的片要 1024 次 Philox；Inductor 的 `rand_like` kernel 光生成这 486 万个数就花 29 µs，我们的核里同样的量占了一半。改成 `tl.rand4x`：片的四个四分之一各取同一组 256 个计数器的 u0..u3（计数器 = 行 × 词表 + 片偏移 + j，行、片之间不重叠），Philox 调用数除以 4；CPU 解释器下 13 个测试照过；5 种噪声变异（去掉行偏移 / 片偏移、seed 固定、四份用同一个 u、Gumbel 少一层 log）里"去掉片偏移"起初漏网——各片用同一组噪声时每个元素仍是 Gumbel 分布，只是片间相关，500 行的 softmax 频率检验看不出来；把等 logits 的均匀性检验改成一行三片就抓住了（片间噪声相同则最大值永远落在第一片），5/5。片宽和 warp 数也做成了 `NANOVLLM_SAMPLE_BLOCK` / `NANOVLLM_SAMPLE_WARPS`（默认 1024 / 4），下一次作业顺便量 2048/8、4096/8、512/4、1024/8。
 - **一个 GPU 测试失败**：`test_samplers_dispatch_…` 里 Triton 核的 log-norm 和编译 torch 路径的在 rtol 1e-5 / atol 1e-4 下对不上（token 一致，CPU 解释器下两边都过）。两边在 GPU 上用的都是近似算术——Triton 的 `/` 是 `div.full.f32`、`exp` / `log` 是 `ex2` / `lg2.approx`，Inductor 走 libdevice——谁偏得多、偏多少，日志里没有数字。测试改成两边各自对 float64 参考（rtol 1e-5、atol 1e-3），`bench_sampler.py --check` 新增：对 64 和 151936 列、bf16 和 f32、6 个温度，打印两条路径对 float64 的最大绝对 / 相对误差和 T=0 的 token 是否等于 `torch.argmax`（含片内、跨片并列），第七次作业先跑它。q 用的是 `exp(logit/T − log_norm)`，log-norm 偏 1e-4 只让 q 偏 0.01%，对接受率没有影响。
 
+### 复测 6（作业 1275031，2026-11-09，代码 18cdad5 = d6a7d8b 的采样器（rand4x），41 分钟，300 W 节点）
+
+脚本 `nanovllm-sampled7-a40.sbatch`：GPU 测试（84 过、1 败、20 跳），`bench_sampler.py --check`，`--profile` 跑 HEAD 和 ad6d386，五组片宽 / warp 数只计墙钟，再跑 15 行（去掉了开关对和 profiler 对）。原始行在 `docs/benchmarks/qwen3-8b-a40-sampled.txt` 第六段，`--check` 的全部输出在 `results/1275031/check.txt`。
+
+| 每次调用 GPU µs（第一级 + 第二级 kernel） | batch 1 | batch 8 | batch 32 |
+|---|---|---|---|
+| ad6d386（`tl.rand`） | 4.0 + 2.8 | 17.4 + 2.8 | 60.5 + 3.8 |
+| d6a7d8b（`tl.rand4x`） | 3.8 + 2.8 | 13.2 + 2.8 | **45.0 + 3.9** |
+
+- **Philox 省四分之三，kernel 快 25%**：batch 32 的第一级 60.5 → 45.0 µs（9.7 MB，215 GB/s），batch 8 17.4 → 13.2；每次调用 GPU 时间 64 → 49 µs。墙钟仍是 120 µs 上下（启动开销），引擎里看不见。
+- **片宽 / warp 数没有结论**：五组变体只量了墙钟（没开 `--profile`，是脚本的疏忽），batch 32 上 2048/8、4096/8、512/4、1024/8、2048/4 的 `DraftSampler` 分别是 107.7 / 106.8 / 109.7 / 108.0 / 110.1 µs，默认 1024/4 那一遍是 125.3——但 batch 1（GPU 只有 7 µs）上同样差 15–20 µs，说明这是不同进程之间启动开销的抖动，不是 kernel 的差别。默认保持 1024/4；要比片宽得看 profiler 里的 kernel 时间，留给下一次作业（如果还有必要）。
+- **精度查清了**：`--check` 下两条路径对 float64 的 log-norm 误差都在 1e-7 相对以内（64 / 151936 列、bf16 / f32、T = 0.001–2.0 都是），T=0 的 token 两边都等于 `torch.argmax`（含片内、跨片并列和 −inf 行）。上一次作业测试失败的原因是 **Inductor 编译的 torch 路径在 T=0 的行上 log-sum-exp 溢出成 inf**（`logits / 1e-10` 约 1e11，Inductor 的 `logsumexp` 分解在 GPU 上没能稳住，eager 和 CPU 都是有限值），Triton 核在同一行上是有限的、相对误差 5e-8。T=0 的行从不读 log-norm（贪心行的接受判断是 argmax 比较），所以这只影响测试：测试改成 Triton 核对全部行、torch 路径只对 T>0 的行。这次作业的 1 个失败就是改之前的这条断言。
+- **端到端**：chat batch 32 每步 argmax 58.8 / 59.2 ms、采样 59.6 / 59.6（多 0.4–0.8；996212 是 0.6–0.7），batch 8 44.0 对 44.3，batch 1 39.0 对 39.0。吞吐采样 / argmax：chat batch 32 +5.4% / +6.1%、batch 8 +0.9%（这次接受率只涨 0.013）、batch 1 +2.9%、混合 +8.5%（接受率 0.569 对 0.548，步数 431 对 488）；T=0 对照 1120.5 对 1120.1 tok/s，token 和步数完全相同。
+- **这条线到此为止**：采样草稿的额外开销从 2.8 ms（244661，eager softmax）→ 2.0（278958）→ 0.6–1.6（281207）→ 0.4–0.8 ms（这次），占 60 ms 一步的 1%，而且剩下的能逐项对上账（4 次草稿采样 0.2 ms，拒绝采样器采样分支比 one-hot 多 0.25 ms，草稿 logits 读写）。再往下是把拒绝采样器的采样分支（728 µs，一步一次）也写成 Triton，最多再省 0.3 ms（0.5%），不值一次作业；真要省得把采样器放进 CUDA graph 把启动开销也抹掉，那是另一个工程。
+
 ## 还没做的
 
 - GPU 上 Qwen3-8B 的吞吐对比：已做（见上）。原文：注意力的 `(B, k+1)` 形状、CUDA graph、编译后的拒绝采样器都只能在 GPU 上验证。A40 作业脚本 `cluster/nanovllm-a40.sbatch` 会跑 GPU 测试（贪心结果和 transformers 对比，同步、异步、投机三种模式），以及吞吐对比：随机 prompt（ngram 基本猜不中，看最坏情况）、代码修改任务（让模型给源文件加 docstring 后原样输出）和开放问答，batch 1/8/32，k=0/2/4。草稿模型的 GPU 测试（0.6B 给自己打草稿，接受率应接近 1）在 `tests/test_model_gpu.py` 的 `draft` 模式里。
 - ngram 版和异步调度合并：要把 ngram 查找搬到 GPU 上（vLLM 的做法是 CPU 上查、但等上一步落地，等于放弃了异步）。草稿模型版已经合并（见上）。
 - k 自适应：按 batch 大小关草稿已做并复测（batch 32 关草稿时 edit ×0.98、chat ×1.00）；按每个草稿位的接受率调 k 已做并同场复测（草稿模型上 edit batch 1 ×3.2、chat batch 32 ×1.19，固定 k=4 只有 ×1.04；n-gram 在 chat batch 32 上从 ×0.74 回到 ×0.99，差距查清是三条 `torch.compile` 守卫，见上）。每条序列一个 k（混合负载需要）已做并在 A40 上量完（见上）：机制对、接受率涨，但哪一格都没赢过 batch 级开关——varlen 丢 CUDA graph，pad 算的行和草稿步数与 batch 用 k_max 一样多，而混合负载里"白算"的位置在读权重为主的 decode 下本来只值两个点；要赢得把 ragged 注意力放进 CUDA graph（按总行数分桶）并让草稿模型只给需要的序列跑需要的步数，还没做。还没做的还有把 batch 大小的阈值按 target 何时算力受限来定（这台 A40 上 8B + 0.6B 用 8 太低），让 K 本身跟着负载走，以及按行数在 varlen 和 pad 之间自动选。
-- 从草稿模型的分布采样草稿（而不是 argmax），按 `min(1, p/q)` 接受：已做并在 A40 上量完（见上）：chat 接受率 0.39 → 0.42，吞吐 batch 8 +2–7%、batch 32 +4–8%，edit 不变，T=0 一个 token 都不变；每步多出的 2 ms 查到是 Inductor 不切分带 argmax 的归约，采样器先改成两级分块归约（e88f54d、62ddc96），三次 A40 作业量下来 `Sampler` 和拒绝采样器快了 15–26%，`DraftSampler` 却纹丝不动——Inductor 对 persistent / looped 的选择控制不了、噪声张量去不掉；`DraftSampler` 和 `Sampler` 在 GPU 上改成手写的 Triton 融合核（`fused_sample`，噪声寄存器内生成、logits 只读一遍），第六次 A40 作业（996212）量到两个采样器的 GPU 时间 207 / 167 → 64 µs、每步差距收窄到 0.6 ms；Philox 改成 `rand4x`（第七次作业验证中）；剩下的大头是拒绝采样器采样分支的 728 µs，下一个要用 Triton 重写的是它。
+- 从草稿模型的分布采样草稿（而不是 argmax），按 `min(1, p/q)` 接受：已做并在 A40 上量完（见上）：chat 接受率 0.39 → 0.42，吞吐 batch 8 +2–7%、batch 32 +4–8%，edit 不变，T=0 一个 token 都不变；每步多出的 2 ms 查到是 Inductor 不切分带 argmax 的归约，采样器先改成两级分块归约（e88f54d、62ddc96），三次 A40 作业量下来 `Sampler` 和拒绝采样器快了 15–26%，`DraftSampler` 却纹丝不动——Inductor 对 persistent / looped 的选择控制不了、噪声张量去不掉；`DraftSampler` 和 `Sampler` 在 GPU 上改成手写的 Triton 融合核（`fused_sample`，噪声寄存器内生成、logits 只读一遍），第六次 A40 作业（996212）量到两个采样器的 GPU 时间 207 / 167 → 64 µs、每步差距收窄到 0.6 ms；Philox 改成 `rand4x` 后 kernel 再快 25%（作业 1275031：GPU 49 µs 一次），每步差距 0.4–0.8 ms，占一步的 1%，能逐项对账；这条线到此为止（见复测 6）。
 - EAGLE-3 草稿头（可选）。
 - ngram 索引在 CPU 上：长 prompt 第一次 decode 要建索引，每个 token 4 次字典写入。
 
