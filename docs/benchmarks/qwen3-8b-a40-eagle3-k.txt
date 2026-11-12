@@ -1,0 +1,25 @@
+# Job 1734939, 2026-11-11, 1x A40 (300 W node, 1740 MHz), code fabf36c (EAGLE-3 head + engines freeing the GPU on exit),
+# 36 min. Qwen3-8B target, bf16, max_model_len 4096, TORCH_LOGS=recompiles; the EAGLE-3 head RedHatAI/Qwen3-8B-speculator.eagle3
+# (drafter=eagle3) against the same-run baseline of every workload and batch. Follow-up of job 1733657 (qwen3-8b-a40-eagle3.txt):
+# the k the head wants (k=2 / k=3 on chat at batch 32 and 8, with and without async scheduling; k=6 on edit at batch 32; k=3 on
+# the mixed batch) and the GPU tests again after the fixture fix. All 14 rows; every row's exit code 0. The first field is the
+# row's name in the job script (cluster/nanovllm-eagle2-a40.sbatch); "outputs A vs B" lines compare the T=0 token ids of two runs.
+# GPU tests: the three eagle modes on the 8B, each in its own process (reference in bf16, tolerance 1.0): 3 passed + 2 skipped
+# each; the draft-model modes on the 0.6B in one process (the run that failed from the second mode on in 1733657): 15 passed,
+# 10 skipped. nvidia-smi showed 0 MiB in use between every run.
+chat32_base workload=chat drafter=none k=0 async=0 disable_by=None min_acc=None probe=16 per_seq=0 ragged_mode=pad batch=32 T=0.0 sampled_drafts=1 tokens=31064 time=29.70s throughput=1045.8tok/s acceptance=0.000 acc_pos= k_steps=1022 ragged=0.00 capped=0.00
+chat32_eagle2 workload=chat drafter=eagle3 k=2 async=0 disable_by=None min_acc=None probe=16 per_seq=0 ragged_mode=pad batch=32 T=0.0 sampled_drafts=1 tokens=31088 time=22.26s throughput=1396.7tok/s acceptance=0.496 acc_pos=0.61,0.38 k_steps=0,0,564 ragged=0.00 capped=0.00
+chat32_eagle3 workload=chat drafter=eagle3 k=3 async=0 disable_by=None min_acc=None probe=16 per_seq=0 ragged_mode=pad batch=32 T=0.0 sampled_drafts=1 tokens=31088 time=21.92s throughput=1418.2tok/s acceptance=0.397 acc_pos=0.62,0.37,0.20 k_steps=0,0,0,532 ragged=0.00 capped=0.00
+chat32_eagle2_async workload=chat drafter=eagle3 k=2 async=1 disable_by=None min_acc=None probe=16 per_seq=0 ragged_mode=pad batch=32 T=0.0 sampled_drafts=1 tokens=31088 time=21.37s throughput=1455.0tok/s acceptance=0.495 acc_pos=0.61,0.38 k_steps=0,0,564 ragged=0.00 capped=0.00
+chat32_eagle3_async workload=chat drafter=eagle3 k=3 async=1 disable_by=None min_acc=None probe=16 per_seq=0 ragged_mode=pad batch=32 T=0.0 sampled_drafts=1 tokens=31088 time=21.14s throughput=1470.9tok/s acceptance=0.399 acc_pos=0.62,0.37,0.20 k_steps=0,0,0,534 ragged=0.00 capped=0.00
+outputs chat32_eagle2.json vs chat32_eagle2_async.json: 8/64 requests differ, first at request 7 token 499
+outputs chat32_eagle3.json vs chat32_eagle3_async.json: 32/64 requests differ, first at request 0 token 453
+chat8_base workload=chat drafter=none k=0 async=0 disable_by=None min_acc=None probe=16 per_seq=0 ragged_mode=pad batch=8 T=0.0 sampled_drafts=1 tokens=7840 time=26.73s throughput=293.3tok/s acceptance=0.000 acc_pos= k_steps=1022 ragged=0.00 capped=0.00
+chat8_eagle2 workload=chat drafter=eagle3 k=2 async=0 disable_by=None min_acc=None probe=16 per_seq=0 ragged_mode=pad batch=8 T=0.0 sampled_drafts=1 tokens=7782 time=18.06s throughput=430.9tok/s acceptance=0.493 acc_pos=0.61,0.37 k_steps=0,0,556 ragged=0.00 capped=0.00
+chat8_eagle3 workload=chat drafter=eagle3 k=3 async=0 disable_by=None min_acc=None probe=16 per_seq=0 ragged_mode=pad batch=8 T=0.0 sampled_drafts=1 tokens=7800 time=17.57s throughput=444.0tok/s acceptance=0.404 acc_pos=0.63,0.39,0.20 k_steps=0,0,0,532 ragged=0.00 capped=0.00
+chat8_eagle4 workload=chat drafter=eagle3 k=4 async=0 disable_by=None min_acc=None probe=16 per_seq=0 ragged_mode=pad batch=8 T=0.0 sampled_drafts=1 tokens=7736 time=17.97s throughput=430.5tok/s acceptance=0.322 acc_pos=0.61,0.38,0.20,0.10 k_steps=0,0,0,0,502 ragged=0.00 capped=0.00
+edit32_base workload=edit drafter=none k=0 async=0 disable_by=None min_acc=None probe=16 per_seq=0 ragged_mode=pad batch=32 T=0.0 sampled_drafts=1 tokens=24512 time=35.96s throughput=681.6tok/s acceptance=0.000 acc_pos= k_steps=1022 ragged=0.00 capped=0.00
+edit32_eagle4 workload=edit drafter=eagle3 k=4 async=0 disable_by=None min_acc=None probe=16 per_seq=0 ragged_mode=pad batch=32 T=0.0 sampled_drafts=1 tokens=24505 time=22.63s throughput=1083.0tok/s acceptance=0.591 acc_pos=0.79,0.66,0.52,0.40 k_steps=0,0,0,0,340 ragged=0.00 capped=0.00
+edit32_eagle6 workload=edit drafter=eagle3 k=6 async=0 disable_by=None min_acc=None probe=16 per_seq=0 ragged_mode=pad batch=32 T=0.0 sampled_drafts=1 tokens=24499 time=24.40s throughput=1004.2tok/s acceptance=0.469 acc_pos=0.78,0.64,0.51,0.39,0.28,0.21 k_steps=0,0,0,0,0,0,312 ragged=0.00 capped=0.00
+mixed32_base workload=mixed drafter=none k=0 async=0 disable_by=None min_acc=None probe=16 per_seq=0 ragged_mode=pad batch=32 T=0.0 sampled_drafts=1 tokens=28352 time=33.59s throughput=844.1tok/s acceptance=0.000 acc_pos= k_steps=1022 ragged=0.00 capped=0.00
+mixed32_eagle3 workload=mixed drafter=eagle3 k=3 async=0 disable_by=None min_acc=None probe=16 per_seq=0 ragged_mode=pad batch=32 T=0.0 sampled_drafts=1 tokens=28226 time=24.82s throughput=1137.1tok/s acceptance=0.506 acc_pos=0.69,0.49,0.33 k_steps=0,0,0,512 ragged=0.00 capped=0.00
