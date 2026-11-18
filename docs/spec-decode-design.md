@@ -738,13 +738,28 @@ batch 8：两个采样器 GPU 时间 20.4 µs（62ddc96 是 51.0 / 55.7），墙
 
 结论：头的默认用法是 k=3（chat、混合负载），edit 用 k=4；加异步调度。README 的数字按这次更新。
 
+### 头和 target 共用一张 embedding 表（2026-11-18）
+
+头的 checkpoint 里带着一份 `embed_tokens`（151936 × 4096，bf16 下 1.24 GB，占头 2.04 GB 权重的六成）。按 speculators 的做法，这份应当就是 target 的 embedding（训练头时冻结，存盘时原样带上）。照 534ef3f 的写法两张表都上了 GPU，头那张除了占显存没有别的用处。
+
+现在 `ModelRunner` 把两个模型都加载完之后调 `Eagle3Head.share_embeddings`，传进 target 的 `embed_tokens`：dtype 相同且 `torch.equal` 才共享，把头的 `embed_tokens` 换成 target 的那个模块，自己那份当场释放；不相等（比如换了一个自己训过 embedding 的头）就保持原样，行为和以前完全一样。vLLM 加载 EAGLE 头时做的是同一个比较（`vllm/v1/spec_decode/llm_base_proposer.py`：先 `torch.equal`，相同就删掉头的 `embed_tokens` 指向 target 的）。
+
+两个细节：
+
+- **释放要赶在算 KV 预算之前。** `allocate_kv_cache` 的预算是 `total × gpu_memory_utilization − 已用 − 预热峰值 + 当前`，"已用"是那一刻显卡上实际占着的。共享发生在 `warmup_model` 之前（它开头就 `empty_cache`），所以省下的 1.24 GB 直接变成 KV 块：带头时一个块是 37.7 MB（target 的 KV）+ 1.0 MB（头的 KV）+ 2.1 MB（隐状态 cache）= 40.9 MB，算下来多 30 个块、7680 个 token 的位置。
+- **光把模块换掉不会释放。** `VocabParallelEmbedding` 在参数上挂了 `weight.weight_loader = self.weight_loader`，参数 → 绑定方法 → 模块 → 参数是一个引用环，引用计数归不了零，要等 gc。`share_embeddings` 先 `del` 掉自己那个参数上的 `weight_loader` 再换模块，函数返回时那份表就没了，不依赖 gc 什么时候跑。CPU 测试用 weakref 卡这一条。
+
+测试：`tests/test_eagle3_head.py` 在 CPU 上用真的 `Eagle3Head` 和 `VocabParallelEmbedding`（单进程 gloo 进程组）测四种情况：权重相同（共享、旧表立即释放、之后改 target 的表，头读到的也跟着变）、差一个元素、词表大小不同、dtype 不同（值相同，只有 dtype 检查拦得住）。五个变异（去掉 `del`、去掉 dtype 检查、去掉 `torch.equal`、不换模块、返回值写反）都被抓到。GPU 测试 `test_eagle_head_shares_the_target_embedding_when_its_own_is_a_copy` 从 checkpoint 里读出头的 embedding 和 target 的比，断言"共享了"当且仅当"两张表相同"。
+
+还没在 A40 上跑：这个 checkpoint 的表和 Qwen3-8B 的是不是逐位相同、KV 块实际多了多少，等下一次作业。
+
 ## 还没做的
 
 - GPU 上 Qwen3-8B 的吞吐对比：已做（见上）。原文：注意力的 `(B, k+1)` 形状、CUDA graph、编译后的拒绝采样器都只能在 GPU 上验证。A40 作业脚本 `cluster/nanovllm-a40.sbatch` 会跑 GPU 测试（贪心结果和 transformers 对比，同步、异步、投机三种模式），以及吞吐对比：随机 prompt（ngram 基本猜不中，看最坏情况）、代码修改任务（让模型给源文件加 docstring 后原样输出）和开放问答，batch 1/8/32，k=0/2/4。草稿模型的 GPU 测试（0.6B 给自己打草稿，接受率应接近 1）在 `tests/test_model_gpu.py` 的 `draft` 模式里。
 - ngram 版和异步调度合并：要把 ngram 查找搬到 GPU 上（vLLM 的做法是 CPU 上查、但等上一步落地，等于放弃了异步）。草稿模型版已经合并（见上）。
 - k 自适应：按 batch 大小关草稿已做并复测（batch 32 关草稿时 edit ×0.98、chat ×1.00）；按每个草稿位的接受率调 k 已做并同场复测（草稿模型上 edit batch 1 ×3.2、chat batch 32 ×1.19，固定 k=4 只有 ×1.04；n-gram 在 chat batch 32 上从 ×0.74 回到 ×0.99，差距查清是三条 `torch.compile` 守卫，见上）。每条序列一个 k（混合负载需要）已做并在 A40 上量完（见上）：机制对、接受率涨，但哪一格都没赢过 batch 级开关——varlen 丢 CUDA graph，pad 算的行和草稿步数与 batch 用 k_max 一样多，而混合负载里"白算"的位置在读权重为主的 decode 下本来只值两个点；要赢得把 ragged 注意力放进 CUDA graph（按总行数分桶）并让草稿模型只给需要的序列跑需要的步数，还没做。还没做的还有把 batch 大小的阈值按 target 何时算力受限来定（这台 A40 上 8B + 0.6B 用 8 太低），让 K 本身跟着负载走，以及按行数在 varlen 和 pad 之间自动选。
 - 从草稿模型的分布采样草稿（而不是 argmax），按 `min(1, p/q)` 接受：已做并在 A40 上量完（见上）：chat 接受率 0.39 → 0.42，吞吐 batch 8 +2–7%、batch 32 +4–8%，edit 不变，T=0 一个 token 都不变；每步多出的 2 ms 查到是 Inductor 不切分带 argmax 的归约，采样器先改成两级分块归约（e88f54d、62ddc96），三次 A40 作业量下来 `Sampler` 和拒绝采样器快了 15–26%，`DraftSampler` 却纹丝不动——Inductor 对 persistent / looped 的选择控制不了、噪声张量去不掉；`DraftSampler` 和 `Sampler` 在 GPU 上改成手写的 Triton 融合核（`fused_sample`，噪声寄存器内生成、logits 只读一遍），第六次 A40 作业（996212）量到两个采样器的 GPU 时间 207 / 167 → 64 µs、每步差距收窄到 0.6 ms；Philox 改成 `rand4x` 后 kernel 再快 25%（作业 1275031：GPU 49 µs 一次），每步差距 0.4–0.8 ms，占一步的 1%，能逐项对账；这条线到此为止（见复测 6）。
-- EAGLE-3 草稿头：已做并在 A40 上量完（见上，两次作业）。chat batch 32 ×1.36（k=3；加异步 ×1.41）、batch 8 ×1.51、batch 1 ×1.82，edit batch 32 ×1.59、batch 1 ×2.87，混合 ×1.35；chat 上赢 0.6B 草稿模型（×1.07 / ×1.72），edit 上输给它（×3.22），原因是头便宜但接受率低（自回归的隐状态逐位累积误差、32000 的草稿词表）。还可以做的：头的 `embed_tokens` 和 target 的一样，共享省 1.2 GB；前缀缓存共享块末位那一位的头 KV；让 K 跟着接受率自动落到 3（开关现在落到 2）。
+- EAGLE-3 草稿头：已做并在 A40 上量完（见上，两次作业）。chat batch 32 ×1.36（k=3；加异步 ×1.41）、batch 8 ×1.51、batch 1 ×1.82，edit batch 32 ×1.59、batch 1 ×2.87，混合 ×1.35；chat 上赢 0.6B 草稿模型（×1.07 / ×1.72），edit 上输给它（×3.22），原因是头便宜但接受率低（自回归的隐状态逐位累积误差、32000 的草稿词表）。头和 target 共用 embedding 表已做（见上，CPU 上测过，A40 上待验）。还可以做的：前缀缓存共享块末位那一位的头 KV；让 K 跟着接受率自动落到 3（开关现在落到 2）。
 - ngram 索引在 CPU 上：长 prompt 第一次 decode 要建索引，每个 token 4 次字典写入。
 
 ## 面试时可以讲的取舍

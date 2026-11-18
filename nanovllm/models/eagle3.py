@@ -136,6 +136,21 @@ class Eagle3Head(nn.Module):
         # step reads the positions it lacks (ModelRunner.propose).
         self.hidden_cache = torch.tensor([])
 
+    def share_embeddings(self, embed_tokens: VocabParallelEmbedding) -> bool:
+        """Embed tokens with the target's embedding module instead of the head's own, if the two
+        hold the same weights: a speculators checkpoint carries a copy of the target's embedding
+        (frozen while the head was trained), and one table on the GPU is enough. Returns whether
+        it shared; a head with an embedding of its own keeps it. vLLM does the same comparison
+        when it loads an EAGLE head."""
+        own, target = self.embed_tokens.weight, embed_tokens.weight
+        if own.dtype != target.dtype or not torch.equal(own, target):    # equal: same shape too
+            return False
+        # The parameter holds its module through the bound weight_loader, a cycle that only the
+        # garbage collector would free; without it the copy's memory is back when this returns.
+        del own.weight_loader
+        self.embed_tokens = embed_tokens
+        return True
+
     def store_hidden_states(self, aux_hidden_states: torch.Tensor):
         """Called by the target model with its aux layers' inputs, concatenated, (N, 3 * target
         hidden): fuses them and writes the result to the hidden cache at the context's slots."""

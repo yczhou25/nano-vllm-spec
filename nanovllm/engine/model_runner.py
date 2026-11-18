@@ -69,6 +69,9 @@ class ModelRunner:
                 if self.eagle:    # the target hands the head its aux layers' inputs every forward
                     self.model.model.aux_hidden_state_layers = config.draft_hf_config.aux_hidden_state_layers
                     self.model.model.aux_hidden_state_hook = self.draft_model.store_hidden_states
+                    # The head's embedding is a copy of the target's in the checkpoints we know: dropped
+                    # here, before the KV cache is sized, its memory goes to KV blocks instead.
+                    self.draft_model.share_embeddings(self.model.model.embed_tokens)
             self.sampler = Sampler()
             self.rejection_sampler = RejectionSampler()
             self.draft_sampler = DraftSampler()
