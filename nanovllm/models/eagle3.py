@@ -136,15 +136,18 @@ class Eagle3Head(nn.Module):
         # step reads the positions it lacks (ModelRunner.propose).
         self.hidden_cache = torch.tensor([])
 
-    def share_embeddings(self, embed_tokens: VocabParallelEmbedding) -> bool:
-        """Embed tokens with the target's embedding module instead of the head's own, if the two
-        hold the same weights: a speculators checkpoint carries a copy of the target's embedding
-        (frozen while the head was trained), and one table on the GPU is enough. Returns whether
-        it shared; a head with an embedding of its own keeps it. vLLM does the same comparison
-        when it loads an EAGLE head."""
+    def share_embeddings(self, embed_tokens: VocabParallelEmbedding, own_loaded: bool = True) -> bool:
+        """Embed tokens with the target's embedding module instead of the head's own, in the two
+        cases where the head has nothing of its own to lose, and return whether it did. A
+        checkpoint saved without `embed_tokens` (own_loaded False) means the head was trained on
+        the target's embedding and expects it at run time: its own table was never loaded. A
+        checkpoint whose table equals the target's is a copy, and one table on the GPU is enough.
+        A head with a table of its own (RedHatAI/Qwen3-8B-speculator.eagle3 is one) keeps it.
+        vLLM draws the same three cases when it loads an EAGLE head."""
         own, target = self.embed_tokens.weight, embed_tokens.weight
-        if own.dtype != target.dtype or not torch.equal(own, target):    # equal: same shape too
+        if own_loaded and (own.dtype != target.dtype or not torch.equal(own, target)):    # equal: same shape too
             return False
+        assert own.shape == target.shape, f"the head embeds {tuple(own.shape)} and has no table of its own; the target's is {tuple(target.shape)}"
         # The parameter holds its module through the bound weight_loader, a cycle that only the
         # garbage collector would free; without it the copy's memory is back when this returns.
         del own.weight_loader

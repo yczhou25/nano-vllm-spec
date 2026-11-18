@@ -1,0 +1,40 @@
+# Job 1744637, 2026-11-18, 1x A40 (300 W node, 1740 MHz), code 9789d2c (the EAGLE-3 head takes the target's token embedding
+# when its own equals it), 16 min. Qwen3-8B target, bf16, max_model_len 4096, TORCH_LOGS=recompiles; head
+# RedHatAI/Qwen3-8B-speculator.eagle3. Job script cluster/nanovllm-eagle3-a40.sbatch.
+# "blocks" lines: an engine with the head (k=3) built with the sharing logic on, then with it patched out ("own copy kept").
+# The head did not share either way: its table is not equal to the target's, so both runs are the same configuration, and so
+# are the two chat rows below (chat32_eagle3, chat32_eagle3_own): a repeat within one job.
+# GPU tests: async_eagle and eagle_acceptance, each in its own process: 4 passed, 2 skipped (the new test included: the
+# engine shares exactly when the checkpoint's table allows it). The first process (-k "eagle and not ...") selected the new
+# test for every mode by its name and ran out of GPU memory behind the draft-model modes: 17 errors, the eagle mode did not run.
+blocks: shared_embedding=False kv_blocks=603 gpu_used_gib=41.13 allocated_gib=40.23
+blocks (own copy kept): shared_embedding=False kv_blocks=603 gpu_used_gib=41.13 allocated_gib=40.23
+chat32_base workload=chat drafter=none k=0 async=0 disable_by=None min_acc=None probe=16 per_seq=0 ragged_mode=pad batch=32 T=0.0 sampled_drafts=1 tokens=31064 time=29.71s throughput=1045.7tok/s acceptance=0.000 acc_pos= k_steps=1022 ragged=0.00 capped=0.00
+chat32_eagle3 workload=chat drafter=eagle3 k=3 async=0 disable_by=None min_acc=None probe=16 per_seq=0 ragged_mode=pad batch=32 T=0.0 sampled_drafts=1 tokens=31088 time=22.09s throughput=1407.6tok/s acceptance=0.397 acc_pos=0.62,0.37,0.20 k_steps=0,0,0,532 ragged=0.00 capped=0.00
+chat32_eagle3_own workload=chat drafter=eagle3 k=3 async=0 disable_by=None min_acc=None probe=16 per_seq=0 ragged_mode=pad batch=32 T=0.0 sampled_drafts=1 tokens=31088 time=22.07s throughput=1408.9tok/s acceptance=0.397 acc_pos=0.62,0.37,0.20 k_steps=0,0,0,532 ragged=0.00 capped=0.00
+outputs chat32_eagle3.json vs chat32_eagle3_own.json: identical
+
+# Job 1744730, 2026-11-18, CPU only, 41 s: the two embedding tables read from the checkpoints and compared
+# (cluster/nanovllm-embdiff.sbatch). "as bf16": both cast to bf16, what the engine compares.
+embdiff: head speculators_config {"algorithm": "eagle3", "default_proposal_method": "greedy", "proposal_methods": [{"accept_tolerance": 0.0, "proposal_type": "greedy", "speculative_tokens": 3, "verifier_accept_k": 1}], "verifier": {"architectures": ["Qwen3ForCausalLM"], "name_or_path": "Qwen/Qwen3-8B"}}
+embdiff: target model.embed_tokens.weight BF16 [151936, 4096] in model-00001-of-00005.safetensors
+embdiff: head embed_tokens.weight BF16 [151936, 4096] in model.safetensors
+embdiff: elements differing as stored 622278012 of 622329856 (99.992%); as bf16 622278012 (99.992%), of which 1642557 where |target| < 6.2e-5
+embdiff: rows differing (bf16) 151936 of 151936; inside the draft vocabulary 32000 of 32000, outside 119936 of 119936
+embdiff: abs diff max 1.1719e-01 mean 2.1109e-03; mean |target| 1.7142e-02; least-squares scale head/target 0.876864; norm ratio 0.876866
+embdiff: row cosine min 0.999997 mean 0.999998; rows below 0.999: 0
+embdiff: first differing elements (row, col, target, head) [(0, 0, 0.049560546875, 0.04345703125), (0, 1, 0.037109375, 0.032470703125), (0, 2, 0.0291748046875, 0.025634765625), (0, 3, -0.0189208984375, -0.0166015625), (0, 4, -0.0213623046875, -0.018798828125), (0, 5, -0.0027008056640625, -0.0023651123046875)]
+
+# Job 1744748, 2026-11-18, CPU only, 26 s: how far apart the two tables' rows are after the head's input_layernorm
+# (RMSNorm without its weight, eps from the head's config), row by row (cluster/nanovllm-embnorm.sbatch). "direction-only":
+# the same with eps = 0.
+embnorm: eps 1e-06; input_layernorm.weight min 0.0011 max 0.9375 mean 0.5203
+embnorm: normed-row distance (relative), quantiles 50/99/99.9/99.99%: 2.259e-03, 7.154e-03, 2.905e-02, 6.695e-02, max 1.212e-01
+embnorm: rows above 0.5%: 2192, above 1%: 1081, above 5%: 33 of 151936
+embnorm: direction-only distance, quantiles: 1.859e-03, 2.043e-03, 2.100e-03, 2.128e-03, max 2.514e-03
+embnorm: target row mean square: min 2.229e-08, quantiles 0.01/0.1/1/50%: 1.024e-06, 3.964e-06, 2.088e-05, 5.142e-04; rows below 1e-4: 8263, below 1e-5: 735
+embnorm: per-row scale head/target: min 0.875687 max 0.878450 mean 0.876863 std 5.39e-05
+embnorm: normed rows as bf16: 214136243 of 622329856 elements differ (34.41%), 1604198 by more than 2%
+embnorm: worst rows (row, distance, direction-only, target mean square, scale, in draft vocab) [(127572, '1.212e-01', '1.827e-03', '2.229e-08', 0.87663, False), (83971, '1.201e-01', '1.794e-03', '3.146e-08', 0.87685, False), (79270, '1.093e-01', '1.827e-03', '1.537e-07', 0.87685, False), (83969, '1.053e-01', '1.656e-03', '2.067e-07', 0.87685, False), (79269, '1.005e-01', '1.891e-03', '2.756e-07', 0.87679, False), (151300, '8.239e-02', '1.953e-03', '6.025e-07', 0.87686, False), (88372, '8.069e-02', '1.465e-03', '6.411e-07', 0.87685, False), (151294, '7.752e-02', '1.691e-03', '7.170e-07', 0.87686, False), (127734, '7.748e-02', '1.827e-03', '7.179e-07', 0.87686, False), (143335, '7.699e-02', '1.761e-03', '7.294e-07', 0.87692, False)]
+embnorm: inside the draft vocabulary: 32000 rows, distance max 2.941e-03, median 2.246e-03
+embnorm: outside the draft vocabulary: 119936 rows, distance max 1.212e-01, median 2.263e-03

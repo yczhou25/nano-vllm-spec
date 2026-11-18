@@ -17,8 +17,12 @@ def get_tensor(model: nn.Module, name: str) -> torch.Tensor:
         return model.get_buffer(name)
 
 
-def load_model(model: nn.Module, path: str):
+def load_model(model: nn.Module, path: str) -> set[str]:
+    """Loads every tensor of the checkpoint into the model and returns their names in the
+    checkpoint: a parameter the checkpoint lacks keeps whatever it was created with, and the
+    caller may need to know (an EAGLE-3 head saved without its token embedding)."""
     packed_modules_mapping = getattr(model, "packed_modules_mapping", {})
+    loaded = set()
     for file in glob(os.path.join(path, "*.safetensors")):
         with safe_open(file, "pt", "cpu") as f:
             for weight_name in f.keys():
@@ -34,3 +38,5 @@ def load_model(model: nn.Module, path: str):
                     param = get_tensor(model, weight_name)
                     weight_loader = getattr(param, "weight_loader", default_weight_loader)
                     weight_loader(param, f.get_tensor(weight_name))
+                loaded.add(weight_name)
+    return loaded

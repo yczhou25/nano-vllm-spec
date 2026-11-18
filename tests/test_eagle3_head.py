@@ -6,10 +6,12 @@ from types import SimpleNamespace
 import pytest
 import torch
 import torch.distributed as dist
+from safetensors.torch import save_file
 
 from nanovllm.layers.embed_head import VocabParallelEmbedding
 from nanovllm.models import eagle3
 from nanovllm.models.eagle3 import Eagle3Head
+from nanovllm.utils.loader import load_model
 
 VOCAB, HIDDEN = 64, 16
 
@@ -82,3 +84,39 @@ def test_head_keeps_an_embedding_of_another_shape_or_dtype(head, vocab, dtype):
 
     assert head.embed_tokens is own
     assert own.weight.dtype == torch.get_default_dtype()
+
+
+def test_head_without_a_table_of_its_own_takes_the_target_embedding(head):
+    embed_tokens = target_embedding(head)
+    embed_tokens.weight.data += 0.125    # nothing like what the head's never-loaded table happens to hold
+    own_weight = weakref.ref(head.embed_tokens.weight)
+
+    assert head.share_embeddings(embed_tokens, own_loaded=False)
+
+    assert head.embed_tokens is embed_tokens
+    assert own_weight() is None
+
+
+def test_head_without_a_table_of_its_own_needs_the_target_shape(head):
+    with pytest.raises(AssertionError, match="no table of its own"):
+        head.share_embeddings(target_embedding(head, VOCAB // 2), own_loaded=False)
+
+
+@pytest.mark.parametrize("with_embedding", [True, False])
+def test_loader_reports_whether_the_checkpoint_had_the_embedding(head, tmp_path, with_embedding):
+    target = target_embedding(head)
+    target.weight.data += 0.125
+    checkpoint = {"fc.weight": torch.full_like(head.fc.weight, 0.5), "t2d": torch.ones(VOCAB, dtype=torch.bool)}
+    if with_embedding:
+        checkpoint["embed_tokens.weight"] = torch.full((VOCAB, HIDDEN), 0.25)
+    save_file(checkpoint, str(tmp_path / "model.safetensors"))
+
+    loaded = load_model(head, str(tmp_path))
+
+    assert loaded == set(checkpoint)
+    assert torch.equal(head.fc.weight, checkpoint["fc.weight"]) and head.t2d.all()
+    # The head's own (different) table stays when the checkpoint brought one; without one the
+    # head has only uninitialized memory there and embeds with the target's.
+    assert head.share_embeddings(target, "embed_tokens.weight" in loaded) == (not with_embedding)
+    expected = torch.full((HIDDEN,), 0.25) if with_embedding else target.weight[3]
+    assert torch.equal(head.embed_tokens(torch.tensor([3]))[0], expected)

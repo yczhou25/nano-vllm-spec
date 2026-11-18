@@ -187,17 +187,18 @@ def test_sampling_returns_max_tokens(llm):
     assert [len(output["token_ids"]) for output in outputs] == [MAX_TOKENS] * len(prompts)
 
 
-def test_eagle_head_shares_the_target_embedding_when_its_own_is_a_copy(llm):
+def test_head_embeds_with_the_target_table_unless_it_has_its_own(llm):    # no "eagle" in the name: -k eagle selects modes
     if not llm.scheduler.has_eagle_head:
         pytest.skip("needs an EAGLE-3 head")
     from safetensors import safe_open
     runner = llm.model_runner
     target = runner.model.model.embed_tokens
+    checkpoint_weight = None
     for file in glob(os.path.join(EAGLE_MODEL, "*.safetensors")):
         with safe_open(file, "pt", "cpu") as f:
             names = f.keys()
             if "embed_tokens.weight" in names:
                 checkpoint_weight = f.get_tensor("embed_tokens.weight")
     # On the CPU: the reference model and the engine have the GPU between them.
-    is_copy = torch.equal(checkpoint_weight.to(target.weight.dtype), target.weight.cpu())
-    assert (runner.draft_model.embed_tokens is target) == is_copy
+    has_its_own = checkpoint_weight is not None and not torch.equal(checkpoint_weight.to(target.weight.dtype), target.weight.cpu())
+    assert (runner.draft_model.embed_tokens is target) != has_its_own

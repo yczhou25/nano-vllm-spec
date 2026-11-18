@@ -65,13 +65,13 @@ class ModelRunner:
             load_model(self.model, config.model)
             if config.speculative_model is not None:
                 self.draft_model = Eagle3Head(config.draft_hf_config) if self.eagle else Qwen3ForCausalLM(config.draft_hf_config)
-                load_model(self.draft_model, config.speculative_model)
+                loaded = load_model(self.draft_model, config.speculative_model)
                 if self.eagle:    # the target hands the head its aux layers' inputs every forward
                     self.model.model.aux_hidden_state_layers = config.draft_hf_config.aux_hidden_state_layers
                     self.model.model.aux_hidden_state_hook = self.draft_model.store_hidden_states
-                    # The head's embedding is a copy of the target's in the checkpoints we know: dropped
-                    # here, before the KV cache is sized, its memory goes to KV blocks instead.
-                    self.draft_model.share_embeddings(self.model.model.embed_tokens)
+                    # A head saved without its embedding, or with a copy of the target's, embeds with the
+                    # target's table: its own is dropped here, before the KV cache is sized.
+                    self.draft_model.share_embeddings(self.model.model.embed_tokens, "embed_tokens.weight" in loaded)
             self.sampler = Sampler()
             self.rejection_sampler = RejectionSampler()
             self.draft_sampler = DraftSampler()
