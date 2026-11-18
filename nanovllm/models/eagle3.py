@@ -130,29 +130,69 @@ class Eagle3Head(nn.Module):
         self.register_buffer("d2t", torch.zeros(config.draft_vocab_size, dtype=torch.int64))
         self.register_buffer("t2d", torch.zeros(config.vocab_size, dtype=torch.bool))
         self.target_token_ids = None    # d2t as the target token of every draft token, once the weights are loaded
+        self.embed_scale = 1.0          # what a row of embed_tokens is multiplied by: not 1 with the target's table standing in for a scaled copy (share_embeddings)
         # The target's fused hidden state of every position its KV cache holds, at the same slot
         # (ModelRunner binds it: num_kvcache_blocks * block_size rows, plus one that masked slots
         # write to). The target writes it every forward (store_hidden_states); the head's catch-up
         # step reads the positions it lacks (ModelRunner.propose).
         self.hidden_cache = torch.tensor([])
 
+    SCALED_COPY_TOL = 0.005    # of a row's length; bf16 rounds an element by up to 0.4% of its value
+
     def share_embeddings(self, embed_tokens: VocabParallelEmbedding, own_loaded: bool = True) -> bool:
-        """Embed tokens with the target's embedding module instead of the head's own, in the two
-        cases where the head has nothing of its own to lose, and return whether it did. A
-        checkpoint saved without `embed_tokens` (own_loaded False) means the head was trained on
-        the target's embedding and expects it at run time: its own table was never loaded. A
-        checkpoint whose table equals the target's is a copy, and one table on the GPU is enough.
-        A head with a table of its own (RedHatAI/Qwen3-8B-speculator.eagle3 is one) keeps it.
-        vLLM draws the same three cases when it loads an EAGLE head."""
+        """Embed tokens with the target's embedding module instead of the head's own, in the
+        cases where the head has nothing of its own to lose, and return whether it did:
+
+        - a checkpoint saved without `embed_tokens` (own_loaded False): the head was trained on
+          the target's embedding and expects it at run time, its own table was never loaded;
+        - a table equal to the target's: a copy, and one table on the GPU is enough;
+        - a table that is the target's times one factor (scale_of_copy), as that of
+          RedHatAI/Qwen3-8B-speculator.eagle3 is (0.877): the target's rows times the factor
+          are the head's rows again (embed).
+
+        A head with any other table keeps it. vLLM shares in the first two cases."""
         own, target = self.embed_tokens.weight, embed_tokens.weight
-        if own_loaded and (own.dtype != target.dtype or not torch.equal(own, target)):    # equal: same shape too
+        if not own_loaded:
+            assert own.shape == target.shape, f"the head embeds {tuple(own.shape)} and has no table of its own; the target's is {tuple(target.shape)}"
+        elif own.dtype != target.dtype:
             return False
-        assert own.shape == target.shape, f"the head embeds {tuple(own.shape)} and has no table of its own; the target's is {tuple(target.shape)}"
+        elif not torch.equal(own, target):    # equal: same shape too
+            scale = self.scale_of_copy(own, target, self.SCALED_COPY_TOL)
+            if scale is None:
+                return False
+            self.embed_scale = scale
         # The parameter holds its module through the bound weight_loader, a cycle that only the
         # garbage collector would free; without it the copy's memory is back when this returns.
         del own.weight_loader
         self.embed_tokens = embed_tokens
         return True
+
+    @staticmethod
+    @torch.no_grad()
+    def scale_of_copy(own: torch.Tensor, target: torch.Tensor, tol: float, rows_per_step: int = 16384) -> float | None:
+        """c if every row of `own` is the same row of `target` times c, to within `tol` of the
+        row's length (rounding), else None. c is the least-squares factor over the whole table;
+        a row that points elsewhere, or is scaled by something else, is further than `tol` away."""
+        if own.shape != target.shape:
+            return None
+        steps = range(0, own.size(0), rows_per_step)
+        dot = sum((own[a:a + rows_per_step].float() * target[a:a + rows_per_step].float()).sum(dtype=torch.float64).item() for a in steps)
+        norm = sum(target[a:a + rows_per_step].float().pow(2).sum(dtype=torch.float64).item() for a in steps)
+        scale = dot / norm if norm > 0 else 0.0
+        if not scale > 0:    # nan too
+            return None
+        for a in steps:
+            t = target[a:a + rows_per_step].float() * scale
+            distance = (own[a:a + rows_per_step].float() - t).pow(2).sum(1)
+            if (distance > tol ** 2 * t.pow(2).sum(1)).any():
+                return None
+        return scale
+
+    def embed(self, input_ids: torch.Tensor) -> torch.Tensor:
+        embeds = self.embed_tokens(input_ids)
+        if self.embed_scale != 1.0:    # in float32: bf16 would round the factor itself to 8 bits
+            embeds = (embeds.float() * self.embed_scale).to(embeds.dtype)
+        return embeds
 
     def store_hidden_states(self, aux_hidden_states: torch.Tensor):
         """Called by the target model with its aux layers' inputs, concatenated, (N, 3 * target
@@ -170,7 +210,7 @@ class Eagle3Head(nn.Module):
     def forward(self, input_ids: torch.Tensor, positions: torch.Tensor, hidden_states: torch.Tensor) -> torch.Tensor:
         """(N, 2 * hidden): the normed output compute_logits takes, then the residual stream the
         next draft step feeds back as its hidden state."""
-        embeds = self.embed_tokens(input_ids)
+        embeds = self.embed(input_ids)
         hidden_states, residual = self.layers[0](positions, embeds, hidden_states)
         normed, residual = self.norm(hidden_states, residual)
         return torch.cat([normed, residual], dim=-1)

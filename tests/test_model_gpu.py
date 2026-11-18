@@ -192,13 +192,21 @@ def test_head_embeds_with_the_target_table_unless_it_has_its_own(llm):    # no "
         pytest.skip("needs an EAGLE-3 head")
     from safetensors import safe_open
     runner = llm.model_runner
-    target = runner.model.model.embed_tokens
+    head, target = runner.draft_model, runner.model.model.embed_tokens
+    shared = head.embed_tokens is target
     checkpoint_weight = None
     for file in glob(os.path.join(EAGLE_MODEL, "*.safetensors")):
         with safe_open(file, "pt", "cpu") as f:
             names = f.keys()
             if "embed_tokens.weight" in names:
                 checkpoint_weight = f.get_tensor("embed_tokens.weight")
-    # On the CPU: the reference model and the engine have the GPU between them.
-    has_its_own = checkpoint_weight is not None and not torch.equal(checkpoint_weight.to(target.weight.dtype), target.weight.cpu())
-    assert (runner.draft_model.embed_tokens is target) != has_its_own
+    if checkpoint_weight is None:    # the head was saved without a table
+        assert shared and head.embed_scale == 1.0
+        return
+    # The checkpoint's table against the target's, on the CPU (the reference model and the engine
+    # have the GPU between them): a copy, the target's times one factor, or the head's own.
+    own, weight = checkpoint_weight.to(target.weight.dtype), target.weight.cpu()
+    scale = 1.0 if torch.equal(own, weight) else head.scale_of_copy(own, weight, head.SCALED_COPY_TOL)
+    assert shared == (scale is not None)
+    if shared:
+        assert head.embed_scale == pytest.approx(scale, rel=1e-4)

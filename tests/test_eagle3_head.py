@@ -54,7 +54,7 @@ def test_head_takes_the_target_embedding_when_the_weights_are_the_same(head):
     assert head.share_embeddings(embed_tokens)
 
     assert head.embed_tokens is embed_tokens
-    assert torch.equal(head.embed_tokens(ids), before)
+    assert head.embed_scale == 1.0 and torch.equal(head.embed(ids), before)
     # One table: the head's copy is gone as soon as it shares (no garbage collection in between;
     # the engine sizes its KV cache from what is free right after), and its parameters list the
     # target's weight under the checkpoint's name.
@@ -66,7 +66,7 @@ def test_head_takes_the_target_embedding_when_the_weights_are_the_same(head):
 
 def test_head_keeps_an_embedding_that_differs_in_one_weight(head):
     embed_tokens = target_embedding(head)
-    embed_tokens.weight.data[VOCAB - 1, HIDDEN - 1] += 0.125
+    embed_tokens.weight.data[VOCAB - 1, HIDDEN - 1] += 2.0    # a tenth of the row's length: no rounding
     own = head.embed_tokens
 
     assert not head.share_embeddings(embed_tokens)
@@ -120,3 +120,65 @@ def test_loader_reports_whether_the_checkpoint_had_the_embedding(head, tmp_path,
     assert head.share_embeddings(target, "embed_tokens.weight" in loaded) == (not with_embedding)
     expected = torch.full((HIDDEN,), 0.25) if with_embedding else target.weight[3]
     assert torch.equal(head.embed_tokens(torch.tensor([3]))[0], expected)
+
+
+SCALE = 0.876864    # what RedHatAI/Qwen3-8B-speculator.eagle3's table is of Qwen3-8B's
+
+
+def scaled_copy(weight, scale=SCALE, noise=0.002):
+    """`weight` times `scale`, every element off by up to `noise` of its value, as rounding to bf16 leaves a table."""
+    generator = torch.Generator().manual_seed(1)
+    return weight * scale * (1 + noise * (2 * torch.rand(weight.shape, generator=generator) - 1))
+
+
+def test_head_takes_the_target_embedding_for_a_scaled_copy(head):
+    embed_tokens = target_embedding(head)
+    embed_tokens.weight.data[9] = 0    # an unused token's row
+    own = scaled_copy(embed_tokens.weight.data)
+    head.embed_tokens.weight.data.copy_(own)
+    own_weight = weakref.ref(head.embed_tokens.weight)
+    ids = torch.tensor([0, 5, 9, VOCAB - 1])
+
+    assert head.share_embeddings(embed_tokens)
+
+    assert head.embed_tokens is embed_tokens and own_weight() is None
+    assert head.embed_scale == pytest.approx(SCALE, rel=1e-4)
+    # The target's rows times the factor are the head's rows again, to the rounding.
+    embeds = head.embed(ids)
+    assert embeds.dtype == own.dtype
+    assert ((embeds - own[ids]).norm(dim=1) <= 0.002 * own[ids].norm(dim=1)).all()
+
+
+@pytest.mark.parametrize("change", ["row_scaled_otherwise", "row_turned", "noisy", "negated"])
+def test_head_keeps_a_table_that_is_not_one_factor_times_the_target(head, change):
+    embed_tokens = target_embedding(head)
+    own = scaled_copy(embed_tokens.weight.data)
+    if change == "row_scaled_otherwise":
+        own[7] *= 1.02
+    elif change == "row_turned":
+        own[7, 0] += 0.03 * own[7].norm()
+    elif change == "noisy":
+        own = scaled_copy(embed_tokens.weight.data, noise=0.03)
+    else:
+        own = -own
+    head.embed_tokens.weight.data.copy_(own)
+    kept = head.embed_tokens
+
+    assert not head.share_embeddings(embed_tokens)
+
+    assert head.embed_tokens is kept and head.embed_scale == 1.0
+    assert torch.equal(head.embed(torch.tensor([7]))[0], own[7])
+
+
+def test_scale_of_copy_checks_every_row_against_the_tolerance():
+    torch.manual_seed(2)
+    target = torch.randn(VOCAB, HIDDEN)
+    target[:16] = 0    # a first step of unused rows: the factor is the whole table's
+    own = target * SCALE
+    assert Eagle3Head.scale_of_copy(own, target, 1e-5, rows_per_step=16) == pytest.approx(SCALE, rel=1e-6)
+    own[VOCAB - 1] *= 1.003    # the last row of the last step, 0.3% longer than the factor makes it
+    assert Eagle3Head.scale_of_copy(own, target, 0.005, rows_per_step=16) == pytest.approx(SCALE, rel=1e-4)
+    assert Eagle3Head.scale_of_copy(own, target, 0.002, rows_per_step=16) is None
+    assert Eagle3Head.scale_of_copy(own[:16], target, 0.005) is None    # another shape
+    assert Eagle3Head.scale_of_copy(own, torch.zeros_like(target), 0.005) is None
+
