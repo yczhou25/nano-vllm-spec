@@ -38,3 +38,22 @@ embnorm: normed rows as bf16: 214136243 of 622329856 elements differ (34.41%), 1
 embnorm: worst rows (row, distance, direction-only, target mean square, scale, in draft vocab) [(127572, '1.212e-01', '1.827e-03', '2.229e-08', 0.87663, False), (83971, '1.201e-01', '1.794e-03', '3.146e-08', 0.87685, False), (79270, '1.093e-01', '1.827e-03', '1.537e-07', 0.87685, False), (83969, '1.053e-01', '1.656e-03', '2.067e-07', 0.87685, False), (79269, '1.005e-01', '1.891e-03', '2.756e-07', 0.87679, False), (151300, '8.239e-02', '1.953e-03', '6.025e-07', 0.87686, False), (88372, '8.069e-02', '1.465e-03', '6.411e-07', 0.87685, False), (151294, '7.752e-02', '1.691e-03', '7.170e-07', 0.87686, False), (127734, '7.748e-02', '1.827e-03', '7.179e-07', 0.87686, False), (143335, '7.699e-02', '1.761e-03', '7.294e-07', 0.87692, False)]
 embnorm: inside the draft vocabulary: 32000 rows, distance max 2.941e-03, median 2.246e-03
 embnorm: outside the draft vocabulary: 119936 rows, distance max 1.212e-01, median 2.263e-03
+
+# Job 1744764, 2026-11-18, 1x A40 on another node (46068 MiB, 250 W limit; the jobs above: 49140 MiB, 300 W), so block
+# counts and throughput compare within this job only. Code 8a8f7e4 (a head whose table is the target's times one factor
+# embeds with the target's table and multiplies the factor back), 22 min. Same models and settings as job 1744637.
+# "own" rows and "own copy kept": share_embeddings patched to return False, the head keeps its table.
+# recompiles: TORCH_LOGS=recompiles lines of that run. "outputs" lines compare the T=0 token ids of the two runs above them.
+# GPU tests: eagle, async_eagle, eagle_acceptance, each in its own process: 4 passed, 2 skipped.
+blocks: shared_embedding=True embed_scale=0.876864 kv_blocks=563 gpu_used_gib=38.45 allocated_gib=37.54
+blocks (own copy kept): shared_embedding=False embed_scale=1.000000 kv_blocks=532 gpu_used_gib=38.42 allocated_gib=37.52
+chat32_base workload=chat drafter=none k=0 async=0 disable_by=None min_acc=None probe=16 per_seq=0 ragged_mode=pad batch=32 T=0.0 sampled_drafts=1 tokens=31064 time=35.14s throughput=884.0tok/s acceptance=0.000 acc_pos= k_steps=1022 ragged=0.00 capped=0.00 recompiles=11
+chat32_eagle3 workload=chat drafter=eagle3 k=3 async=0 disable_by=None min_acc=None probe=16 per_seq=0 ragged_mode=pad batch=32 T=0.0 sampled_drafts=1 tokens=31088 time=25.51s throughput=1218.5tok/s acceptance=0.397 acc_pos=0.62,0.37,0.20 k_steps=0,0,0,532 ragged=0.00 capped=0.00 recompiles=18
+chat32_eagle3_own workload=chat drafter=eagle3 k=3 async=0 disable_by=None min_acc=None probe=16 per_seq=0 ragged_mode=pad batch=32 T=0.0 sampled_drafts=1 tokens=31088 time=25.71s throughput=1209.0tok/s acceptance=0.397 acc_pos=0.62,0.37,0.20 k_steps=0,0,0,532 ragged=0.00 capped=0.00 recompiles=18
+outputs chat32_eagle3.json vs chat32_eagle3_own.json: 8/64 requests differ, first at request 0 token 457
+chat1_eagle3 workload=chat drafter=eagle3 k=3 async=0 disable_by=None min_acc=None probe=16 per_seq=0 ragged_mode=pad batch=1 T=0.0 sampled_drafts=1 tokens=3905 time=63.63s throughput=61.4tok/s acceptance=0.390 acc_pos=0.62,0.36,0.19 k_steps=0,0,0,1800 ragged=0.00 capped=0.00 recompiles=18
+chat1_eagle3_own workload=chat drafter=eagle3 k=3 async=0 disable_by=None min_acc=None probe=16 per_seq=0 ragged_mode=pad batch=1 T=0.0 sampled_drafts=1 tokens=3905 time=63.35s throughput=61.6tok/s acceptance=0.393 acc_pos=0.62,0.37,0.19 k_steps=0,0,0,1793 ragged=0.00 capped=0.00 recompiles=18
+outputs chat1_eagle3.json vs chat1_eagle3_own.json: identical
+edit32_eagle4 workload=edit drafter=eagle3 k=4 async=0 disable_by=None min_acc=None probe=16 per_seq=0 ragged_mode=pad batch=32 T=0.0 sampled_drafts=1 tokens=24673 time=25.89s throughput=952.9tok/s acceptance=0.595 acc_pos=0.80,0.66,0.52,0.40 k_steps=0,0,0,0,339 ragged=0.00 capped=0.00 recompiles=18
+edit32_eagle4_own workload=edit drafter=eagle3 k=4 async=0 disable_by=None min_acc=None probe=16 per_seq=0 ragged_mode=pad batch=32 T=0.0 sampled_drafts=1 tokens=24673 time=25.70s throughput=960.0tok/s acceptance=0.594 acc_pos=0.80,0.66,0.52,0.40 k_steps=0,0,0,0,340 ragged=0.00 capped=0.00 recompiles=18
+outputs edit32_eagle4.json vs edit32_eagle4_own.json: identical
