@@ -35,6 +35,8 @@ class LLMEngine:
         self.scheduler = Scheduler(config)
         self.async_scheduling = config.async_scheduling
         self.pending = None
+        self.clock = perf_counter
+        self.last_decode_time = None    # when the last decode step's tokens were in (see time_decode_step)
         atexit.register(self.exit)
 
     def exit(self):
@@ -56,7 +58,9 @@ class LLMEngine:
         num_tokens = sum(seq.num_scheduled_tokens for seq in seqs) if is_prefill else -len(seqs)
         if not self.async_scheduling:
             token_ids = self.model_runner.call("run", seqs, is_prefill)
-            finished = self.scheduler.postprocess(self.scheduler.commit(seqs, is_prefill), token_ids)
+            batch = self.scheduler.commit(seqs, is_prefill)
+            finished = self.scheduler.postprocess(batch, token_ids)
+            self.time_decode_step(batch)
         else:
             # Launch this step before waiting for the previous one, so the GPU always has work queued
             # while the CPU schedules and post-processes.
@@ -69,10 +73,25 @@ class LLMEngine:
                 batch, output = pending
                 token_ids = output.result()
                 finished = self.scheduler.postprocess(batch, token_ids)
+                self.time_decode_step(batch)
         if not is_prefill and token_ids and isinstance(token_ids[0], list):    # speculative decoding: the tokens a step produced
             num_tokens = -sum(map(len, token_ids))
         outputs = [(seq.seq_id, seq.completion_token_ids) for seq in finished]
         return outputs, num_tokens
+
+    def time_decode_step(self, batch: list[tuple]):
+        """With adaptive k by cost: a decode step's time is the time from the previous decode step's
+        tokens to its own, which the scheduler keeps per batch size and number of drafts. With
+        async scheduling the next step is queued behind it, so that is its GPU time (or its CPU
+        time, whichever is longer); without, it is its whole time. The first decode step after a
+        prefill step is not timed: its interval holds the prefill."""
+        if not self.scheduler.k_by_cost or not batch:
+            return
+        now = self.clock()
+        _, is_prefill, _, num_tokens, _ = batch[0]
+        if not is_prefill and self.last_decode_time is not None:
+            self.scheduler.record_step_time(len(batch), num_tokens - 1, now - self.last_decode_time)
+        self.last_decode_time = None if is_prefill else now
 
     def is_finished(self):
         return self.scheduler.is_finished() and self.pending is None

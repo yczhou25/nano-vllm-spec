@@ -52,6 +52,8 @@ ENGINE_OPTIONS = {
     # with a probe step now and then; the draft model's are mostly accepted (always, when it is the target itself).
     "spec_acceptance": {"num_speculative_tokens": 4, "speculative_min_acceptance": 0.5},
     "draft_acceptance": {"num_speculative_tokens": 4, "speculative_model": DRAFT_MODEL, "speculative_min_acceptance": 0.5},
+    # Adaptive k by cost: every number of drafts is proposed (and timed) in turn first, then the fastest per token.
+    "draft_k_by_cost": {"num_speculative_tokens": 4, "speculative_model": DRAFT_MODEL, "speculative_k_by_cost": True},
     # The same per sequence: the questions' n-gram drafts get cut at different positions, so decode steps are ragged
     # (varlen attention, no CUDA graph); the draft model's are mostly accepted, with the odd near-tie flipped by bf16 noise.
     "spec_per_sequence": {"num_speculative_tokens": 4, "speculative_min_acceptance": 0.5, "speculative_per_sequence": True},
@@ -64,6 +66,8 @@ ENGINE_OPTIONS = {
     "eagle": {"num_speculative_tokens": 4, "speculative_model": EAGLE_MODEL},
     "async_eagle": {"async_scheduling": True, "num_speculative_tokens": 4, "speculative_model": EAGLE_MODEL},
     "eagle_acceptance": {"num_speculative_tokens": 4, "speculative_model": EAGLE_MODEL, "speculative_min_acceptance": 0.5},
+    "eagle_k_by_cost": {"num_speculative_tokens": 4, "speculative_model": EAGLE_MODEL, "speculative_k_by_cost": True},
+    "async_eagle_k_by_cost": {"async_scheduling": True, "num_speculative_tokens": 4, "speculative_model": EAGLE_MODEL, "speculative_k_by_cost": True},
 }
 
 
@@ -168,7 +172,7 @@ def test_sampled_drafts_from_the_target_itself_are_nearly_all_accepted(llm):
     # Argmax drafts are accepted with p(argmax), the model's confidence, far below that.
     from nanovllm import SamplingParams
     scheduler = llm.scheduler
-    if not scheduler.has_draft_model or scheduler.has_eagle_head or not os.path.samefile(DRAFT_MODEL, MODEL) or scheduler.speculative_min_acceptance is not None or scheduler.speculative_disable_by_batch_size is not None:
+    if not scheduler.has_draft_model or scheduler.has_eagle_head or not os.path.samefile(DRAFT_MODEL, MODEL) or scheduler.speculative_min_acceptance is not None or scheduler.k_by_cost or scheduler.speculative_disable_by_batch_size is not None:
         pytest.skip("a draft model drafting for itself with every draft only")
     prompts = [chat(llm.tokenizer, q) for q in QUESTIONS]
     scheduler.reset_stats()

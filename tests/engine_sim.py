@@ -41,14 +41,15 @@ class Violation(AssertionError):
 
 
 def make_config(num_blocks, block_size, max_num_seqs, max_num_batched_tokens, eos=EOS, num_speculative_tokens=0, draft_model=False,
-                speculative_disable_by_batch_size=None, speculative_min_acceptance=None, speculative_per_sequence=False, speculative_ragged="pad", eagle=False):
+                speculative_disable_by_batch_size=None, speculative_min_acceptance=None, speculative_per_sequence=False, speculative_ragged="pad", eagle=False,
+                speculative_k_by_cost=False):
     # Config itself requires a model directory and block sizes that are multiples of 256.
     return types.SimpleNamespace(num_kvcache_blocks=num_blocks, kvcache_block_size=block_size,
                                  max_num_seqs=max_num_seqs, max_num_batched_tokens=max_num_batched_tokens, eos=eos,
                                  num_speculative_tokens=num_speculative_tokens, speculative_model="fake" if draft_model or eagle else None,
                                  speculative_method="eagle3" if eagle else "model" if draft_model else None,
                                  speculative_disable_by_batch_size=speculative_disable_by_batch_size, speculative_min_acceptance=speculative_min_acceptance,
-                                 speculative_per_sequence=speculative_per_sequence, speculative_ragged=speculative_ragged)
+                                 speculative_per_sequence=speculative_per_sequence, speculative_ragged=speculative_ragged, speculative_k_by_cost=speculative_k_by_cost)
 
 
 def make_runner(block_size, world_size=1, rank=0, num_speculative_tokens=0):
@@ -73,18 +74,34 @@ def make_runner(block_size, world_size=1, rank=0, num_speculative_tokens=0):
 
 def make_engine(num_blocks, block_size, max_num_seqs, max_num_batched_tokens, async_scheduling=False, num_speculative_tokens=0, draft_model=False,
                 speculative_disable_by_batch_size=None, speculative_min_acceptance=None, speculative_per_sequence=False, speculative_ragged="pad",
-                speculative_sampled_drafts=True, eagle=False):
+                speculative_sampled_drafts=True, eagle=False, speculative_k_by_cost=False):
     assert not (async_scheduling and num_speculative_tokens and not (draft_model or eagle))
     engine = LLMEngine.__new__(LLMEngine)
     engine.scheduler = Scheduler(make_config(num_blocks, block_size, max_num_seqs, max_num_batched_tokens,
                                              num_speculative_tokens=num_speculative_tokens, draft_model=draft_model,
                                              speculative_disable_by_batch_size=speculative_disable_by_batch_size,
-                                             speculative_min_acceptance=speculative_min_acceptance, speculative_per_sequence=speculative_per_sequence, eagle=eagle))
-    engine.model_runner = FakeModel(engine.scheduler, block_size, num_blocks, num_speculative_tokens=num_speculative_tokens, draft_model=draft_model, eagle=eagle)
+                                             speculative_min_acceptance=speculative_min_acceptance, speculative_per_sequence=speculative_per_sequence, eagle=eagle,
+                                             speculative_k_by_cost=speculative_k_by_cost))
+    model = engine.model_runner = FakeModel(engine.scheduler, block_size, num_blocks, num_speculative_tokens=num_speculative_tokens, draft_model=draft_model, eagle=eagle)
     engine.model_runner.runner.ragged_mode = speculative_ragged
     engine.model_runner.runner.sampled_drafts = speculative_sampled_drafts
     engine.async_scheduling = async_scheduling
     engine.pending = None
+    engine.clock = lambda: model.now    # the fake GPU's time (see FakeModel.launch)
+    engine.last_decode_time = None
+    if engine.scheduler.k_by_cost:
+        record = engine.scheduler.record_step_time
+
+        def checked_record(batch_size, num_drafts, seconds):
+            # The engine times exactly the decode steps whose result follows a decode step's, with
+            # that step's batch size, drafts and fake GPU time, in sync and async mode alike.
+            last, previous = model.results[-1], model.results[-2] if len(model.results) > 1 else None
+            if last[0] or previous is None or previous[0] or (batch_size, num_drafts, seconds) != last[1:]:
+                raise Violation(f"step time {(batch_size, num_drafts, seconds)} recorded after results {previous}, {last}")
+            model.num_recorded_step_times += 1
+            record(batch_size, num_drafts, seconds)
+
+        engine.scheduler.record_step_time = checked_record
     return engine
 
 
@@ -159,10 +176,13 @@ def prepare(runner, seqs, is_prefill):
 
 class FakeOutput:
 
-    def __init__(self, token_ids):
+    def __init__(self, token_ids, model=None, finish=None, info=None):
         self.token_ids = token_ids
+        self.model, self.finish, self.info = model, finish, info
 
     def result(self):
+        if self.model is not None:
+            self.model.read_result(self.finish, self.info)
         return self.token_ids
 
 
@@ -384,6 +404,25 @@ class FakeModel:
         self.prefix_hashes = {}                     # seq_id -> prefix hashes of its tokens so far
         self.draft_prefix_hashes = {}
         self.checked_blocks = set()                 # (block_id, hash) pairs whose KV was checked
+        # A fake GPU clock in integer time units (exact in floats): a step queues behind the previous
+        # one and takes step_cost; reading its result moves the engine's clock to its end.
+        self.now = self.gpu_free = 0
+        self.decode_cost = (0, 0, 0)    # (per row, jump, rows per sequence above which the jump applies): see step_cost
+        self.results = []               # (is_prefill, batch size, drafts, cost) of every step whose result was read, in order
+        self.num_decode_after_decode = self.num_recorded_step_times = 0
+
+    def step_cost(self, seqs, is_prefill):
+        if is_prefill:
+            return 1000 + 10 * sum(seq.num_scheduled_tokens for seq in seqs)
+        q = max(seq.num_scheduled_tokens for seq in seqs)
+        per_row, jump, jump_above = self.decode_cost
+        return 1000 + per_row * len(seqs) * q + jump * (q > jump_above)
+
+    def read_result(self, finish, info):
+        self.now = max(self.now, finish)
+        if not info[0] and self.results and not self.results[-1][0]:
+            self.num_decode_after_decode += 1
+        self.results.append(info)
 
     def draft_miss_mod(self, token_ids, position):
         """How often the fake draft model misses at draft position 0..K-1: one draft in four, or with
@@ -398,6 +437,8 @@ class FakeModel:
         return (8, 4, 2)[min(position, 2)]
 
     def call(self, method_name, seqs, is_prefill):
+        cost = self.step_cost(seqs, is_prefill)    # before run: the step's sizes, as the scheduler set them
+        info = (is_prefill, len(seqs), 0 if is_prefill else max(seq.num_scheduled_tokens for seq in seqs) - 1, cost)
         token_ids = self.run(seqs, is_prefill)
         for seq, t in zip(seqs, token_ids):
             if not is_prefill or seq.num_cached_tokens + seq.num_scheduled_tokens == seq.num_tokens:
@@ -409,7 +450,11 @@ class FakeModel:
         else:    # a row per sequence, -1 padded, as ModelRunner.run_async keeps it
             rows = [t if isinstance(t, list) else [t] for t in token_ids]
             self.runner.last_token_ids = torch.tensor([row + [-1] * (k + 1 - len(row)) for row in rows], dtype=torch.int64, device=DEVICE)
-        return token_ids if method_name == "run" else FakeOutput(token_ids)
+        finish = self.gpu_free = max(self.now, self.gpu_free) + cost
+        if method_name == "run":
+            self.read_result(finish, info)
+            return token_ids
+        return FakeOutput(token_ids, self, finish, info)
 
     def run(self, seqs, is_prefill):
         meta = prepare(self.runner, seqs, is_prefill)
@@ -515,6 +560,24 @@ class FakeModel:
                 raise Violation(f"seq {seq.seq_id}: draft inputs {ids[starts[i] + 1:starts[i] + 1 + num_drafts[i]]} != proposed {draft_model.drafts[i]}")
         return ids, draft_model.drafts
 
+    def expected_k_by_cost(self, scheduler):
+        K = self.num_speculative_tokens
+        # The simulated batches never exceed 8 sequences, the smallest bucket.
+        if scheduler.max_num_seqs > 8 or list(scheduler.step_times) != [8]:
+            raise Violation(f"step times kept for buckets {list(scheduler.step_times)}")
+        table = scheduler.step_times[8]
+        if any(index < scheduler.decode_step_index - 1 - scheduler.STEP_TIME_MAX_AGE for samples in table for index, _ in samples):
+            raise Violation(f"step times older than {scheduler.STEP_TIME_MAX_AGE} decode steps kept: {table} at step {scheduler.decode_step_index}")
+        untimed = [k for k in range(K + 1) if len(table[k]) < scheduler.MIN_STEP_TIME_SAMPLES]
+        if untimed:
+            return max(untimed)
+        rates, expected = [], 1.0
+        for k in range(K + 1):
+            expected += scheduler.acceptance[k] if k else 0.0    # summed in the scheduler's order, so that ties stay ties
+            times = sorted(seconds for _, seconds in table[k])
+            rates.append(expected / times[(len(times) - 1) // 2])
+        return rates.index(max(rates))
+
     def _decode(self, seqs, meta):
         bs = self.block_size
         ids, pos, slots = meta["input_ids"], meta["positions"], meta["slot_mapping"]
@@ -524,10 +587,10 @@ class FakeModel:
         per_sequence = scheduler.speculative_per_sequence
         qs = [seq.num_scheduled_tokens for seq in seqs]    # 1 + each sequence's drafts in this step: none when the batch is large, any number with adaptive k
         q = max(qs)
-        allowed = range(K + 1) if scheduler.speculative_min_acceptance is not None else (0, K)
+        allowed = range(K + 1) if scheduler.speculative_min_acceptance is not None or scheduler.k_by_cost else (0, K)
         if (not per_sequence and any(seq.num_scheduled_tokens != q for seq in seqs)) or any(seq_q - 1 not in allowed for seq_q in qs):
             raise Violation(f"decode step with {qs} tokens per sequence")
-        if scheduler.speculative_disable_by_batch_size is None and scheduler.speculative_min_acceptance is None and q != 1 + K:
+        if scheduler.speculative_disable_by_batch_size is None and scheduler.speculative_min_acceptance is None and not scheduler.k_by_cost and q != 1 + K:
             raise Violation(f"decode step with {q} tokens per sequence, expected {1 + K}")
         ragged = len(set(qs)) > 1
         pad = ragged and self.runner.ragged_mode == "pad"    # every sequence gets q rows, its own right-aligned behind dummy rows
@@ -555,6 +618,21 @@ class FakeModel:
                     raise Violation(f"seq {seq.seq_id}: {seq_q - 1} drafts, expected {expected} at acceptance {[round(a, 3) for a in seq.acceptance[1:]]} "
                                     f"after {self.steps_without_probe} steps without a probe")
             self.steps_without_probe = 0 if all(seq_q - 1 == K for seq_q in qs) else self.steps_without_probe + 1
+        elif scheduler.k_by_cost:
+            # Adaptive k by cost: a step not capped by the batch-size rule nor probing proposes the
+            # largest number of drafts with too few step times in its batch's bucket, or else the one
+            # with the most expected tokens per time unit, computed here from the scheduler's tables
+            # (as they were when it scheduled this step, the stale times already dropped).
+            if capped:
+                expected = 0
+            elif self.steps_without_probe >= scheduler.PROBE_INTERVAL:
+                expected = K
+            else:
+                expected = self.expected_k_by_cost(scheduler)
+            if q - 1 != expected:
+                raise Violation(f"decode step with {q - 1} drafts, expected {expected} at acceptance {[round(a, 3) for a in scheduler.acceptance[1:]]}, "
+                                f"step times {scheduler.step_times}, after {self.steps_without_probe} steps without a probe")
+            self.steps_without_probe = 0 if q - 1 == K else self.steps_without_probe + 1
         elif scheduler.speculative_min_acceptance is not None and scheduler.speculative_disable_by_batch_size is None:
             # Adaptive k alone decides: a step proposes the leading draft positions whose measured
             # acceptance rate reaches the threshold (computed here independently of the scheduler),
@@ -802,6 +880,9 @@ def run_engine(engine, requests, max_steps=50000):
             if seqs[seq_id][0] in outputs:
                 raise Violation(f"seq {seq_id} finished twice")
             outputs[seqs[seq_id][0]] = token_ids
+        model = engine.model_runner
+        if scheduler.k_by_cost and model.num_recorded_step_times != model.num_decode_after_decode:
+            raise Violation(f"{model.num_decode_after_decode} decode steps followed a decode step, {model.num_recorded_step_times} timed")
         live_seqs = [s for s in [*scheduler.running, *scheduler.waiting] if s.block_table]
         check_block_manager(scheduler.block_manager, live_seqs)
         engine.model_runner.check_hashed_blocks(live_seqs)
@@ -876,7 +957,18 @@ def set_acceptance_switch(engine, rng):
     engine.model_runner.mixed_draft_quality = True
 
 
-def run_random_case(seed, async_scheduling=False, num_speculative_tokens=0, draft_model=False, adaptive=False, acceptance=False, per_sequence=False, eagle=False):
+def set_step_costs(engine, rng):
+    """Fake step costs whose best number of drafts changes with the batch and the acceptance, and
+    short step-time windows and ages, so every k is timed, chosen and timed again within a case."""
+    scheduler = engine.scheduler
+    scheduler.STEP_TIME_WINDOW = rng.randint(1, 6)
+    scheduler.MIN_STEP_TIME_SAMPLES = rng.randint(1, scheduler.STEP_TIME_WINDOW)
+    scheduler.STEP_TIME_MAX_AGE = rng.randint(2, 40)
+    engine.model_runner.decode_cost = (rng.randint(0, 200), rng.choice([0, rng.randint(1, 2000)]), rng.randint(1, scheduler.num_speculative_tokens + 1))
+
+
+def run_random_case(seed, async_scheduling=False, num_speculative_tokens=0, draft_model=False, adaptive=False, acceptance=False, per_sequence=False, eagle=False,
+                    k_by_cost=False):
     rng = random.Random(seed)
     bs = rng.choice([2, 3, 4, 8])
     Sequence.block_size = bs
@@ -892,9 +984,11 @@ def run_random_case(seed, async_scheduling=False, num_speculative_tokens=0, draf
                          speculative_disable_by_batch_size=rng.randint(1, 3) if adaptive else None,
                          speculative_min_acceptance=rng.choice([0.2, 0.5, 0.8]) if acceptance else None, speculative_per_sequence=per_sequence,
                          speculative_ragged=rng.choice(["varlen", "pad"]) if per_sequence else "varlen",
-                         speculative_sampled_drafts=rng.random() < 0.7, eagle=eagle)
-    if acceptance:
+                         speculative_sampled_drafts=rng.random() < 0.7, eagle=eagle, speculative_k_by_cost=k_by_cost)
+    if acceptance or k_by_cost:
         set_acceptance_switch(engine, rng)
+    if k_by_cost:
+        set_step_costs(engine, rng)
     requests = random_requests(rng, bs, num_blocks * bs - num_speculative_tokens, pressure)
     outputs = run_engine(engine, requests)
     for i, (_, prompt, sp) in enumerate(requests):
@@ -903,7 +997,8 @@ def run_random_case(seed, async_scheduling=False, num_speculative_tokens=0, draf
             raise Violation(f"request {i}: output {outputs.get(i)} != reference {expected}")
 
 
-def run_random_case_block_256(seed, async_scheduling=False, num_speculative_tokens=0, draft_model=False, adaptive=False, acceptance=False, per_sequence=False, eagle=False):
+def run_random_case_block_256(seed, async_scheduling=False, num_speculative_tokens=0, draft_model=False, adaptive=False, acceptance=False, per_sequence=False, eagle=False,
+                              k_by_cost=False):
     """Same checks with the default block size and realistic token budgets."""
     rng = random.Random(seed)
     bs = 256
@@ -915,9 +1010,11 @@ def run_random_case_block_256(seed, async_scheduling=False, num_speculative_toke
                          speculative_disable_by_batch_size=rng.randint(1, 3) if adaptive else None,
                          speculative_min_acceptance=rng.choice([0.2, 0.5, 0.8]) if acceptance else None, speculative_per_sequence=per_sequence,
                          speculative_ragged=rng.choice(["varlen", "pad"]) if per_sequence else "varlen",
-                         speculative_sampled_drafts=rng.random() < 0.7, eagle=eagle)
-    if acceptance:
+                         speculative_sampled_drafts=rng.random() < 0.7, eagle=eagle, speculative_k_by_cost=k_by_cost)
+    if acceptance or k_by_cost:
         set_acceptance_switch(engine, rng)
+    if k_by_cost:
+        set_step_costs(engine, rng)
     base = [rng.randrange(1, VOCAB) for _ in range(1200)]
     requests = []
     for _ in range(rng.randint(2, 6)):

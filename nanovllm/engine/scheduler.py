@@ -1,6 +1,7 @@
 from collections import deque
+from statistics import median_low
 
-from nanovllm.config import Config
+from nanovllm.config import Config, cuda_graph_batch_sizes
 from nanovllm.engine.sequence import Sequence, SequenceStatus
 from nanovllm.engine.block_manager import BlockManager
 from nanovllm.engine.ngram import NgramProposer
@@ -23,6 +24,20 @@ class Scheduler:
     ACCEPTANCE_WINDOW_PER_SEQUENCE = 16    # steps of one sequence: small, so a sequence that stops copying its prompt is noticed within a few steps
     ACCEPTANCE_PRIOR_PER_SEQUENCE = 1      # accepted samples a new sequence starts with per position: one rejection leaves it at 1/2, not 0
     PROBE_INTERVAL = 16       # decode steps
+    # Adaptive k by cost (speculative_k_by_cost): instead of a threshold, a decode step proposes
+    # the number of drafts k (0 to K) with the most expected tokens per second: (1 + the acceptance
+    # rates of positions 1..k) / the step time of k drafts at this batch size. The engine times
+    # every decode step that follows a decode step (record_step_time); the scheduler keeps the last
+    # STEP_TIME_WINDOW times per batch-size bucket and k, and takes their low median (a pause only
+    # ever adds time). A k with fewer than MIN_STEP_TIME_SAMPLES times in its bucket, counting only
+    # those of the last STEP_TIME_MAX_AGE decode steps, is proposed before any choice is made, the
+    # largest first (the first steps proposing K also measure every position's acceptance), so
+    # every k is timed and a k timed long ago (shorter contexts, another workload) is timed
+    # again. The probe steps stay: they measure the positions above the chosen k.
+    STEP_TIME_WINDOW = 8
+    MIN_STEP_TIME_SAMPLES = 2
+    STEP_TIME_MAX_AGE = 512   # decode steps
+    STEP_TIME_SMALL_BATCH = 8  # batches up to this size share a bucket: a step reads the weights once, whatever the batch (A40, 8B: 25.6 ms at batch 1, about 27 at batch 8)
 
     def __init__(self, config: Config):
         self.max_num_seqs = config.max_num_seqs
@@ -41,6 +56,12 @@ class Scheduler:
         self.acceptance = [1.0] * (self.num_speculative_tokens + 1)
         self.num_acceptance_samples = [0] * (self.num_speculative_tokens + 1)
         self.num_steps_without_probe = 0    # consecutive decode steps that proposed fewer than K drafts
+        self.k_by_cost = bool(config.speculative_k_by_cost) and self.num_speculative_tokens > 0
+        # Batch-size buckets for the step times: the CUDA graph sizes (a batch runs the graph of
+        # the next size up, so it takes that size's time), the small ones merged.
+        self.step_time_buckets = [size for size in cuda_graph_batch_sizes(config.max_num_seqs) if size >= self.STEP_TIME_SMALL_BATCH]
+        self.step_times: dict[int, list[deque[tuple[int, float]]]] = {}    # bucket -> per k: (decode step index, seconds), the last STEP_TIME_WINDOW
+        self.decode_step_index = 0    # decode steps scheduled so far (unlike num_decode_steps, never reset): the clock samples age by
         self.proposer = NgramProposer(config.num_speculative_tokens) if config.num_speculative_tokens and not self.has_draft_model else None
         self.reset_stats()
         self.waiting: deque[Sequence] = deque()
@@ -101,6 +122,8 @@ class Scheduler:
         probe = self.num_steps_without_probe >= self.PROBE_INTERVAL    # every sequence proposes all K positions, to measure the left-out ones again
         if k and self.speculative_min_acceptance is not None and not per_sequence and not probe:
             k = self.num_acceptable_drafts()    # positions rejected too often are left out; the next probe step measures them again
+        elif k and self.k_by_cost and not probe:
+            k = self.num_drafts_by_cost(min(len(self.running), self.max_num_seqs))
         kept_seqs = []
         while self.running and len(scheduled_seqs) < self.max_num_seqs:
             seq = self.running.popleft()
@@ -128,6 +151,7 @@ class Scheduler:
         self.running.extendleft(reversed(kept_seqs))
         if scheduled_seqs:
             self.num_decode_steps += 1
+            self.decode_step_index += 1
             self.num_capped_steps += bool(capped)
             if per_sequence:
                 self.num_ragged_steps += len({seq.num_scheduled_tokens for seq in scheduled_seqs}) > 1
@@ -157,6 +181,40 @@ class Scheduler:
         while k < self.num_speculative_tokens and acceptance[k + 1] >= self.speculative_min_acceptance:
             k += 1
         return k
+
+    def step_time_bucket(self, batch_size: int) -> int:
+        return next((size for size in self.step_time_buckets if size >= batch_size), batch_size)    # above the largest graph: eager, its own size
+
+    def step_time_table(self, batch_size: int) -> list[deque[tuple[int, float]]]:
+        bucket = self.step_time_bucket(batch_size)
+        if bucket not in self.step_times:
+            self.step_times[bucket] = [deque(maxlen=self.STEP_TIME_WINDOW) for _ in range(self.num_speculative_tokens + 1)]
+        return self.step_times[bucket]
+
+    def record_step_time(self, batch_size: int, num_drafts: int, seconds: float):
+        """A decode step of batch_size sequences with num_drafts drafts each took this long (see
+        LLMEngine.time_decode_step)."""
+        self.step_time_table(batch_size)[num_drafts].append((self.decode_step_index, seconds))
+
+    def num_drafts_by_cost(self, batch_size: int) -> int:
+        """The number of drafts with the most expected tokens per second at this batch size, or the
+        largest one still to be timed (see STEP_TIME_WINDOW). Ties go to fewer drafts."""
+        times = self.step_time_table(batch_size)
+        oldest = self.decode_step_index - self.STEP_TIME_MAX_AGE
+        for samples in times:
+            while samples and samples[0][0] < oldest:
+                samples.popleft()
+        for k in range(self.num_speculative_tokens, -1, -1):
+            if len(times[k]) < self.MIN_STEP_TIME_SAMPLES:
+                return k
+        best_k, best_rate, expected = 0, 0.0, 1.0
+        for k, samples in enumerate(times):
+            if k:
+                expected += self.acceptance[k]    # position k is accepted only with the k - 1 before it: the rates add up to the expected accepted drafts
+            rate = expected / median_low([seconds for _, seconds in samples])
+            if rate > best_rate:
+                best_k, best_rate = k, rate
+        return best_k
 
     def preempt(self, seq: Sequence):
         seq.status = SequenceStatus.WAITING

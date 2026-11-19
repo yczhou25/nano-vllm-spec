@@ -6,7 +6,8 @@ from engine_sim import run_random_case, run_random_case_block_256
 
 NUM_CASES = int(os.environ.get("NANOVLLM_SIM_CASES", "300"))
 # (async_scheduling, num_speculative_tokens, draft_model, adaptive: drafts switched off for larger batches,
-#  acceptance: drafts switched off while the measured acceptance rate is low, per_sequence: a number of drafts per sequence, eagle: an EAGLE-3 head)
+#  acceptance: drafts switched off while the measured acceptance rate is low, per_sequence: a number of drafts per sequence, eagle: an EAGLE-3 head,
+#  k_by_cost: the number of drafts with the most expected tokens per unit of (fake) step time)
 MODES = {"sync": (False, 0, False, False, False), "async": (True, 0, False, False, False), "spec1": (False, 1, False, False, False),
          "spec4": (False, 4, False, False, False), "draft1": (False, 1, True, False, False), "draft4": (False, 4, True, False, False),
          "async_draft1": (True, 1, True, False, False), "async_draft4": (True, 4, True, False, False),
@@ -18,7 +19,10 @@ MODES = {"sync": (False, 0, False, False, False), "async": (True, 0, False, Fals
          "eagle1": (False, 1, False, False, False, False, True), "eagle4": (False, 4, False, False, False, False, True),
          "async_eagle4": (True, 4, False, False, False, False, True), "eagle4_adaptive": (False, 4, False, True, False, False, True),
          "async_eagle4_adaptive": (True, 4, False, True, False, False, True), "eagle4_acc": (False, 4, False, False, True, False, True),
-         "eagle4_perseq": (False, 4, False, False, True, True, True), "async_eagle4_perseq": (True, 4, False, False, True, True, True)}
+         "eagle4_perseq": (False, 4, False, False, True, True, True), "async_eagle4_perseq": (True, 4, False, False, True, True, True),
+         "spec4_cost": (False, 4, False, False, False, False, False, True), "draft4_cost": (False, 4, True, False, False, False, False, True),
+         "async_draft4_cost": (True, 4, True, False, False, False, False, True), "draft4_adaptive_cost": (False, 4, True, True, False, False, False, True),
+         "eagle4_cost": (False, 4, False, False, False, False, True, True), "async_eagle4_cost": (True, 4, False, False, False, False, True, True)}
 
 
 @pytest.mark.parametrize("mode", MODES)

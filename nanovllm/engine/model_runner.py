@@ -5,7 +5,7 @@ import torch.distributed as dist
 from multiprocessing.synchronize import Event
 from multiprocessing.shared_memory import SharedMemory
 
-from nanovllm.config import Config
+from nanovllm.config import Config, cuda_graph_batch_sizes
 from nanovllm.engine.sequence import Sequence
 from nanovllm.models.qwen3 import Qwen3ForCausalLM
 from nanovllm.models.eagle3 import Eagle3Head
@@ -163,13 +163,13 @@ class ModelRunner:
 
     def decode_query_lengths(self) -> list[int]:
         """Tokens per sequence a decode step can have: 1 + the drafts, 1 for a step without drafts
-        (a large batch, see Scheduler.schedule), and with adaptive k anything in between."""
+        (a large batch, see Scheduler.schedule), and with adaptive k (a threshold or the cost) anything in between."""
         config = self.config
         q = 1 + self.num_speculative_tokens
         qs = {q}
         if config.speculative_disable_by_batch_size is not None:
             qs.add(1)
-        if config.speculative_min_acceptance is not None:
+        if config.speculative_min_acceptance is not None or config.speculative_k_by_cost:
             qs.update(range(1, q))
         return sorted(qs)
 
@@ -724,7 +724,7 @@ class ModelRunner:
         max_bs = min(self.config.max_num_seqs, 512)
         q = 1 + self.num_speculative_tokens    # tokens per sequence in a decode step with drafts
         max_num_blocks = (config.max_model_len + q - 1 + self.block_size - 1) // self.block_size
-        self.graph_bs = [1, 2, 4, 8] + list(range(16, max_bs + 1, 16))
+        self.graph_bs = cuda_graph_batch_sizes(config.max_num_seqs)
         self.graph_pool = None
         self.graph_vars = dict(
             input_ids=torch.zeros(max_bs * q, dtype=torch.int64, device="cuda"),

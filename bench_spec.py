@@ -9,6 +9,7 @@ import glob
 import json
 import os
 import time
+from statistics import median_low
 
 from nanovllm import LLM, SamplingParams
 
@@ -57,8 +58,9 @@ def main():
     parser.add_argument("--async-scheduling", action="store_true")
     parser.add_argument("--speculative-disable-by-batch-size", type=int, default=None, help="decode without drafts while more sequences than this are running")
     parser.add_argument("--speculative-min-acceptance", type=float, default=None, help="propose only the leading draft positions whose measured acceptance rate reaches this (down to none)")
-    parser.add_argument("--probe-interval", type=int, default=None, help="with --speculative-min-acceptance: decode steps between two full-K probes (default Scheduler.PROBE_INTERVAL)")
+    parser.add_argument("--probe-interval", type=int, default=None, help="with --speculative-min-acceptance or --speculative-k-by-cost: decode steps between two full-K probes (default Scheduler.PROBE_INTERVAL)")
     parser.add_argument("--speculative-per-sequence", action="store_true", help="with --speculative-min-acceptance: a number of drafts per sequence, from its own acceptance rates")
+    parser.add_argument("--speculative-k-by-cost", action="store_true", help="instead of --speculative-min-acceptance: each step proposes the number of drafts with the most expected tokens per second (measured acceptance rates over measured step times)")
     parser.add_argument("--speculative-ragged", choices=["varlen", "pad"], default="pad", help="how a batch with different numbers of drafts runs: varlen attention without CUDA graphs, or padded to the most drafts with the fixed-width kernel and the graphs")
     parser.add_argument("--profile", type=int, default=0, metavar="ROWS", help="after the warmup, run one batch under torch.profiler and print its top ROWS ops by CUDA time and by CPU time")
     parser.add_argument("--save-outputs", default=None, metavar="FILE", help="write every request's token ids to FILE (JSON), to compare runs at T=0")
@@ -66,7 +68,7 @@ def main():
 
     llm = LLM(args.model, enforce_eager=args.enforce_eager, max_model_len=4096, async_scheduling=args.async_scheduling, speculative_disable_by_batch_size=args.speculative_disable_by_batch_size, num_speculative_tokens=args.num_speculative_tokens,
               speculative_model=args.speculative_model, speculative_min_acceptance=args.speculative_min_acceptance, speculative_per_sequence=args.speculative_per_sequence, speculative_ragged=args.speculative_ragged,
-              speculative_sampled_drafts=not args.greedy_drafts)
+              speculative_sampled_drafts=not args.greedy_drafts, speculative_k_by_cost=args.speculative_k_by_cost)
     prompts = build_prompts(llm.tokenizer, args.workload, args.num_prompts, args.max_prompt_tokens)
     sampling_params = SamplingParams(temperature=args.temperature, max_tokens=args.max_tokens)
     llm.generate(prompts[:1], SamplingParams(max_tokens=16), use_tqdm=False)    # warmup
@@ -103,9 +105,15 @@ def main():
     acc_pos = ",".join(f"{a / p:.2f}" if p else "-" for p, a in zip(scheduler.num_proposed_by_position[1:], scheduler.num_accepted_by_position[1:]))
     k_steps = ",".join(map(str, scheduler.num_steps_by_k))
     steps = max(scheduler.num_decode_steps, 1)
-    print(f"workload={args.workload} drafter={drafter} k={args.num_speculative_tokens} async={int(args.async_scheduling)} disable_by={args.speculative_disable_by_batch_size} min_acc={args.speculative_min_acceptance} probe={scheduler.PROBE_INTERVAL} per_seq={int(args.speculative_per_sequence)} ragged_mode={args.speculative_ragged} batch={args.batch_size} T={args.temperature} sampled_drafts={int(not args.greedy_drafts)} "
+    print(f"workload={args.workload} drafter={drafter} k={args.num_speculative_tokens} async={int(args.async_scheduling)} disable_by={args.speculative_disable_by_batch_size} min_acc={args.speculative_min_acceptance} k_by_cost={int(args.speculative_k_by_cost)} probe={scheduler.PROBE_INTERVAL} per_seq={int(args.speculative_per_sequence)} ragged_mode={args.speculative_ragged} batch={args.batch_size} T={args.temperature} sampled_drafts={int(not args.greedy_drafts)} "
           f"tokens={num_tokens} time={t:.2f}s throughput={num_tokens / t:.1f}tok/s acceptance={acceptance:.3f} acc_pos={acc_pos} k_steps={k_steps} "
           f"ragged={scheduler.num_ragged_steps / steps:.2f} capped={scheduler.num_capped_steps / steps:.2f}")
+    if scheduler.k_by_cost:
+        # The step times the choices were made from, per batch-size bucket and number of drafts:
+        # the low median in ms over the samples kept, and their count.
+        for bucket, table in sorted(scheduler.step_times.items()):
+            cells = [f"k{k}={1000 * median_low([s for _, s in samples]):.1f}/{len(samples)}" if samples else f"k{k}=-" for k, samples in enumerate(table)]
+            print(f"step_ms bucket={bucket} " + " ".join(cells))
 
 
 if __name__ == "__main__":

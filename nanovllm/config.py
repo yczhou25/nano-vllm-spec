@@ -4,6 +4,12 @@ from dataclasses import dataclass
 from transformers import AutoConfig
 
 
+def cuda_graph_batch_sizes(max_num_seqs: int) -> list[int]:
+    """The batch sizes ModelRunner captures decode CUDA graphs for; a batch runs the graph of the
+    smallest one that holds it, so its GPU time is that size's."""
+    return [1, 2, 4, 8] + list(range(16, min(max_num_seqs, 512) + 1, 16))
+
+
 @dataclass(slots=True)
 class Config:
     model: str
@@ -20,6 +26,7 @@ class Config:
     speculative_disable_by_batch_size: int | None = None    # decode without drafts while more sequences than this are running
     speculative_min_acceptance: float | None = None    # decode without drafts while the measured draft acceptance rate is below this
     speculative_per_sequence: bool = False    # with speculative_min_acceptance: a number of drafts per sequence, from its own acceptance rates
+    speculative_k_by_cost: bool = False    # instead of a threshold: each decode step proposes the number of drafts (0 to K) with the most expected tokens per second, from the measured acceptance rates and the measured step time of each number of drafts at this batch size
     speculative_sampled_drafts: bool = True    # with a draft model: each draft is sampled from the draft's distribution at the sequence's temperature and verified with min(1, p/q) (exact speculative sampling); False: the draft's argmax, as the n-gram proposer (one-hot q)
     speculative_ragged: str = "pad"    # how a batch with different numbers of drafts runs: "pad" (every sequence padded to the most drafts, fixed-width attention and CUDA graphs; faster except on a mixed batch of 32) or "varlen" (a row per token, varlen attention, no CUDA graph)
     hf_config: AutoConfig | None = None
@@ -38,6 +45,8 @@ class Config:
         assert self.speculative_disable_by_batch_size is None or (self.num_speculative_tokens and self.speculative_disable_by_batch_size >= 1)
         assert self.speculative_min_acceptance is None or (self.num_speculative_tokens and 0.0 <= self.speculative_min_acceptance <= 1.0)
         assert not self.speculative_per_sequence or self.speculative_min_acceptance is not None, "speculative_per_sequence needs speculative_min_acceptance"
+        assert not self.speculative_k_by_cost or (self.num_speculative_tokens and self.speculative_min_acceptance is None), \
+            "speculative_k_by_cost needs num_speculative_tokens and replaces speculative_min_acceptance"
         assert self.speculative_ragged in ("varlen", "pad")
         self.hf_config = AutoConfig.from_pretrained(self.model)
         self.max_model_len = min(self.max_model_len, self.hf_config.max_position_embeddings)
