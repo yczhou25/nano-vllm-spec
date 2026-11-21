@@ -131,7 +131,7 @@ class Scheduler:
         probe = self.num_steps_without_probe >= self.PROBE_INTERVAL    # every sequence proposes all K positions, to measure the left-out ones again
         if k and self.speculative_min_acceptance is not None and not per_sequence and not probe:
             k = self.num_acceptable_drafts()    # positions rejected too often are left out; the next probe step measures them again
-        elif k and self.k_by_cost and not probe:
+        elif k and self.k_by_cost and not probe and self.running:    # (with async scheduling, a step may find nothing to run while the last one finishes)
             batch_size = min(len(self.running), self.max_num_seqs)
             k = self.num_drafts_by_cost(batch_size, sum(seq.num_cached_tokens for seq in islice(self.running, batch_size)))
         kept_seqs = []

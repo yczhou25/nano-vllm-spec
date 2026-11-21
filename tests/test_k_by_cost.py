@@ -302,3 +302,6 @@ def test_the_choice_is_made_at_the_kv_tokens_of_the_batch_being_scheduled():
     scheduler.num_drafts_by_cost = lambda batch_size, kv_tokens: asked.append((batch_size, kv_tokens)) or 1
     seqs, _ = scheduler.schedule()
     assert asked == [(2, 3 + 5)] and [seq.num_scheduled_tokens for seq in seqs] == [2, 2]
+    # Nothing running (async scheduling, the last step still in flight): nothing to choose for.
+    scheduler.running.clear()
+    assert scheduler.schedule() == ([], False) and len(asked) == 1
