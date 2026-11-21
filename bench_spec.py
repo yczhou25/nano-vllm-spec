@@ -9,7 +9,6 @@ import glob
 import json
 import os
 import time
-from statistics import median_low
 
 from nanovllm import LLM, SamplingParams
 
@@ -109,10 +108,13 @@ def main():
           f"tokens={num_tokens} time={t:.2f}s throughput={num_tokens / t:.1f}tok/s acceptance={acceptance:.3f} acc_pos={acc_pos} k_steps={k_steps} "
           f"ragged={scheduler.num_ragged_steps / steps:.2f} capped={scheduler.num_capped_steps / steps:.2f}")
     if scheduler.k_by_cost:
-        # The step times the choices were made from, per batch-size bucket and number of drafts:
-        # the low median in ms over the samples kept, and their count.
+        # The step-time lines the choices were made from, per batch-size bucket and number of
+        # drafts: ms at no KV + ms per 1000 KV tokens, the samples kept, and the KV tokens (in
+        # thousands) of the last one.
         for bucket, table in sorted(scheduler.step_times.items()):
-            cells = [f"k{k}={1000 * median_low([s for _, s in samples]):.1f}/{len(samples)}" if samples else f"k{k}=-" for k, samples in enumerate(table)]
+            lines = scheduler.step_time_lines(table)
+            cells = [f"k{k}={1000 * base:.1f}+{1e6 * slope:.3f}/{len(samples)}@{samples[-1][1] / 1000:.1f}k" if samples else f"k{k}=-"
+                     for k, ((base, slope), samples) in enumerate(zip(lines, table))]
             print(f"step_ms bucket={bucket} " + " ".join(cells))
 
 

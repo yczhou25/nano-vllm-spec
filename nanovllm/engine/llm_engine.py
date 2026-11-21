@@ -81,16 +81,18 @@ class LLMEngine:
 
     def time_decode_step(self, batch: list[tuple]):
         """With adaptive k by cost: a decode step's time is the time from the previous decode step's
-        tokens to its own, which the scheduler keeps per batch size and number of drafts. With
-        async scheduling the next step is queued behind it, so that is its GPU time (or its CPU
-        time, whichever is longer); without, it is its whole time. The first decode step after a
-        prefill step is not timed: its interval holds the prefill."""
+        tokens to its own, which the scheduler keeps per batch size and number of drafts, with the
+        KV tokens the step attended to (the sequences' cached tokens when it was scheduled, as
+        Scheduler.schedule counts them). With async scheduling the next step is queued behind it,
+        so that is its GPU time (or its CPU time, whichever is longer); without, it is its whole
+        time. The first decode step after a prefill step is not timed: its interval holds the prefill."""
         if not self.scheduler.k_by_cost or not batch:
             return
         now = self.clock()
         _, is_prefill, _, num_tokens, _ = batch[0]
         if not is_prefill and self.last_decode_time is not None:
-            self.scheduler.record_step_time(len(batch), num_tokens - 1, now - self.last_decode_time)
+            kv_tokens = sum(start for _, _, start, _, _ in batch)
+            self.scheduler.record_step_time(len(batch), num_tokens - 1, kv_tokens, now - self.last_decode_time)
         self.last_decode_time = None if is_prefill else now
 
     def is_finished(self):

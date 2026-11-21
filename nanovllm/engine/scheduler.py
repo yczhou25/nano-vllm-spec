@@ -1,4 +1,6 @@
+import math
 from collections import deque
+from itertools import islice
 from statistics import median_low
 
 from nanovllm.config import Config, cuda_graph_batch_sizes
@@ -26,15 +28,19 @@ class Scheduler:
     PROBE_INTERVAL = 16       # decode steps
     # Adaptive k by cost (speculative_k_by_cost): instead of a threshold, a decode step proposes
     # the number of drafts k (0 to K) with the most expected tokens per second: (1 + the acceptance
-    # rates of positions 1..k) / the step time of k drafts at this batch size. The engine times
-    # every decode step that follows a decode step (record_step_time); the scheduler keeps the last
-    # STEP_TIME_WINDOW times per batch-size bucket and k, and takes their low median (a pause only
-    # ever adds time). A k with fewer than MIN_STEP_TIME_SAMPLES times in its bucket, counting only
-    # those of the last STEP_TIME_MAX_AGE decode steps, is proposed before any choice is made, the
-    # largest first (the first steps proposing K also measure every position's acceptance), so
-    # every k is timed and a k timed long ago (shorter contexts, another workload) is timed
-    # again. The probe steps stay: they measure the positions above the chosen k.
-    STEP_TIME_WINDOW = 8
+    # rates of positions 1..k) / the step time of k drafts at this batch size and context. The
+    # engine times every decode step that follows a decode step (record_step_time), with the KV
+    # tokens its sequences attend to (their cached tokens, summed); the scheduler keeps the last
+    # STEP_TIME_WINDOW of them per batch-size bucket and k. A step reads the KV of every context,
+    # so its time grows as the contexts do, and the times of different k, taken at different
+    # moments, are compared through a line per k, T_k(x) = c_k + s_k * x at x KV tokens (see
+    # step_time_lines), at the KV tokens of the step being scheduled. A k with fewer than
+    # MIN_STEP_TIME_SAMPLES times in its bucket, counting only those of the last STEP_TIME_MAX_AGE
+    # decode steps, is proposed before any choice is made, the largest first (the first steps
+    # proposing K also measure every position's acceptance), so every k is timed and a k timed
+    # long ago (another workload) is timed again. The probe steps stay: they measure the positions
+    # above the chosen k, and their times, spread over many steps, how the time of K drafts grows.
+    STEP_TIME_WINDOW = 32
     MIN_STEP_TIME_SAMPLES = 2
     STEP_TIME_MAX_AGE = 512   # decode steps
     STEP_TIME_SMALL_BATCH = 8  # batches up to this size share a bucket: a step reads the weights once, whatever the batch (A40, 8B: 25.6 ms at batch 1, about 27 at batch 8)
@@ -57,10 +63,13 @@ class Scheduler:
         self.num_acceptance_samples = [0] * (self.num_speculative_tokens + 1)
         self.num_steps_without_probe = 0    # consecutive decode steps that proposed fewer than K drafts
         self.k_by_cost = bool(config.speculative_k_by_cost) and self.num_speculative_tokens > 0
+        # A separate draft model runs once per draft, reading its own KV cache each time: the KV cost
+        # of a step grows with its drafts. An EAGLE-3 head's cache is one layer, n-gram drafts have none.
+        self.kv_slope_by_drafts = self.has_draft_model and not self.has_eagle_head
         # Batch-size buckets for the step times: the CUDA graph sizes (a batch runs the graph of
         # the next size up, so it takes that size's time), the small ones merged.
         self.step_time_buckets = [size for size in cuda_graph_batch_sizes(config.max_num_seqs) if size >= self.STEP_TIME_SMALL_BATCH]
-        self.step_times: dict[int, list[deque[tuple[int, float]]]] = {}    # bucket -> per k: (decode step index, seconds), the last STEP_TIME_WINDOW
+        self.step_times: dict[int, list[deque[tuple[int, int, float]]]] = {}    # bucket -> per k: (decode step index, KV tokens, seconds), the last STEP_TIME_WINDOW
         self.decode_step_index = 0    # decode steps scheduled so far (unlike num_decode_steps, never reset): the clock samples age by
         self.proposer = NgramProposer(config.num_speculative_tokens) if config.num_speculative_tokens and not self.has_draft_model else None
         self.reset_stats()
@@ -123,7 +132,8 @@ class Scheduler:
         if k and self.speculative_min_acceptance is not None and not per_sequence and not probe:
             k = self.num_acceptable_drafts()    # positions rejected too often are left out; the next probe step measures them again
         elif k and self.k_by_cost and not probe:
-            k = self.num_drafts_by_cost(min(len(self.running), self.max_num_seqs))
+            batch_size = min(len(self.running), self.max_num_seqs)
+            k = self.num_drafts_by_cost(batch_size, sum(seq.num_cached_tokens for seq in islice(self.running, batch_size)))
         kept_seqs = []
         while self.running and len(scheduled_seqs) < self.max_num_seqs:
             seq = self.running.popleft()
@@ -185,20 +195,54 @@ class Scheduler:
     def step_time_bucket(self, batch_size: int) -> int:
         return next((size for size in self.step_time_buckets if size >= batch_size), batch_size)    # above the largest graph: eager, its own size
 
-    def step_time_table(self, batch_size: int) -> list[deque[tuple[int, float]]]:
+    def step_time_table(self, batch_size: int) -> list[deque[tuple[int, int, float]]]:
         bucket = self.step_time_bucket(batch_size)
         if bucket not in self.step_times:
             self.step_times[bucket] = [deque(maxlen=self.STEP_TIME_WINDOW) for _ in range(self.num_speculative_tokens + 1)]
         return self.step_times[bucket]
 
-    def record_step_time(self, batch_size: int, num_drafts: int, seconds: float):
-        """A decode step of batch_size sequences with num_drafts drafts each took this long (see
-        LLMEngine.time_decode_step)."""
-        self.step_time_table(batch_size)[num_drafts].append((self.decode_step_index, seconds))
+    def record_step_time(self, batch_size: int, num_drafts: int, kv_tokens: int, seconds: float):
+        """A decode step of batch_size sequences with num_drafts drafts each, attending to kv_tokens
+        cached tokens in all, took this long (see LLMEngine.time_decode_step)."""
+        self.step_time_table(batch_size)[num_drafts].append((self.decode_step_index, kv_tokens, seconds))
 
-    def num_drafts_by_cost(self, batch_size: int) -> int:
-        """The number of drafts with the most expected tokens per second at this batch size, or the
-        largest one still to be timed (see STEP_TIME_WINDOW). Ties go to fewer drafts."""
+    def step_time_lines(self, times: list[deque[tuple[int, int, float]]]) -> list[tuple[float, float]]:
+        """Per k: (c_k, s_k), the step time of k drafts at x KV tokens being c_k + s_k * x seconds.
+        The slope is fitted by least squares to how each k's own times moved with x: one line per
+        k, with a common slope, or with a separate draft model a slope a + b * k (each draft reads
+        the draft model's KV once more). A k timed at a single x tells nothing about the slope;
+        when only one k moved, the common slope is fitted, and when none did, the slope is 0 (the
+        times are compared as they are). A slope is kept between 0 and the steepest that leaves
+        none of k's times below its line at x = 0, as the KV cannot take more than a whole step.
+        c_k is the low median of (time - s_k * x) over k's times: a pause only ever adds time."""
+        spread = [0.0] * len(times)    # per k: the sum of (x - mean x)^2 over its times
+        moved = [0.0] * len(times)     # per k: the sum of (x - mean x) * (time - mean time)
+        for k, samples in enumerate(times):
+            if len(samples) > 1:
+                mean_x = sum(x for _, x, _ in samples) / len(samples)
+                mean_t = sum(t for _, _, t in samples) / len(samples)
+                spread[k] = sum((x - mean_x) ** 2 for _, x, _ in samples)
+                moved[k] = sum((x - mean_x) * (t - mean_t) for _, x, t in samples)
+        s_uu, s_ku, s_kku = sum(spread), sum(k * w for k, w in enumerate(spread)), sum(k * k * w for k, w in enumerate(spread))
+        m_u, m_ku = sum(moved), sum(k * m for k, m in enumerate(moved))
+        # s_uu * s_kku - s_ku^2, summed without cancellation: 0 unless two k moved.
+        det = sum(spread[g] * spread[h] * (g - h) ** 2 for g in range(len(times)) for h in range(g))
+        a = b = 0.0
+        if self.kv_slope_by_drafts and det > 0:
+            a = (m_u * s_kku - m_ku * s_ku) / det
+            b = (s_uu * m_ku - s_ku * m_u) / det
+        elif s_uu > 0:
+            a = m_u / s_uu
+        lines = []
+        for k, samples in enumerate(times):
+            slope = min([max(0.0, a + b * k)] + [t / x for _, x, t in samples if x > 0])
+            lines.append((median_low([t - slope * x for _, x, t in samples]) if samples else 0.0, slope))
+        return lines
+
+    def num_drafts_by_cost(self, batch_size: int, kv_tokens: int) -> int:
+        """The number of drafts with the most expected tokens per second at this batch size and
+        this many KV tokens, or the largest one still to be timed (see STEP_TIME_WINDOW). Ties go
+        to fewer drafts."""
         times = self.step_time_table(batch_size)
         oldest = self.decode_step_index - self.STEP_TIME_MAX_AGE
         for samples in times:
@@ -208,10 +252,11 @@ class Scheduler:
             if len(times[k]) < self.MIN_STEP_TIME_SAMPLES:
                 return k
         best_k, best_rate, expected = 0, 0.0, 1.0
-        for k, samples in enumerate(times):
+        for k, (base, slope) in enumerate(self.step_time_lines(times)):
             if k:
                 expected += self.acceptance[k]    # position k is accepted only with the k - 1 before it: the rates add up to the expected accepted drafts
-            rate = expected / median_low([seconds for _, seconds in samples])
+            seconds = base + slope * kv_tokens
+            rate = expected / seconds if seconds > 0 else math.inf
             if rate > best_rate:
                 best_k, best_rate = k, rate
         return best_k

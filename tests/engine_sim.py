@@ -15,6 +15,8 @@ fake target writes to a hidden cache) at its catch-up rows and its own output at
 """
 import collections
 import hashlib
+from fractions import Fraction
+from statistics import median_low
 import pickle
 import random
 import types
@@ -38,6 +40,39 @@ DRAFT_SEED = 54321
 
 class Violation(AssertionError):
     pass
+
+
+def fit_slopes(times, by_drafts):
+    """Per k, the slope of the least-squares lines through each k's (x, time) samples, one
+    intercept per k and a slope a + b * k (b = 0 unless by_drafts), solved exactly by elimination
+    on the normal equations; a slope the samples cannot fix is 0 (b first, then a)."""
+    K1 = len(times)
+    for unknowns in (["a", "b"], ["a"]) if by_drafts else (["a"],):
+        columns = [("c", j) for j in range(K1) if times[j]] + [(u, None) for u in unknowns]
+        rows = []
+        for j, samples in enumerate(times):
+            for x, t in samples:
+                row = [Fraction(int(j == c)) if name == "c" else (x if name == "a" else j * x) for name, c in columns]
+                rows.append((row, t))
+        n = len(columns)
+        A = [[sum(r[p] * r[q] for r, _ in rows) for q in range(n)] + [sum(r[p] * t for r, t in rows)] for p in range(n)]
+        singular = False
+        for col in range(n):
+            pivot = next((r for r in range(col, n) if A[r][col] != 0), None)
+            if pivot is None:
+                singular = True
+                break
+            A[col], A[pivot] = A[pivot], A[col]
+            for r in range(n):
+                if r != col and A[r][col] != 0:
+                    f = A[r][col] / A[col][col]
+                    A[r] = [v - f * w for v, w in zip(A[r], A[col])]
+        if singular:
+            continue
+        solution = {name: A[i][n] / A[i][i] for i, (name, _) in enumerate(columns) if name != "c"}
+        a, b = solution.get("a", Fraction(0)), solution.get("b", Fraction(0))
+        return [a + b * j for j in range(K1)]
+    return [Fraction(0)] * K1
 
 
 def make_config(num_blocks, block_size, max_num_seqs, max_num_batched_tokens, eos=EOS, num_speculative_tokens=0, draft_model=False,
@@ -92,16 +127,31 @@ def make_engine(num_blocks, block_size, max_num_seqs, max_num_batched_tokens, as
     if engine.scheduler.k_by_cost:
         record = engine.scheduler.record_step_time
 
-        def checked_record(batch_size, num_drafts, seconds):
+        choose = engine.scheduler.num_drafts_by_cost
+
+        def checked_record(batch_size, num_drafts, kv_tokens, seconds):
             # The engine times exactly the decode steps whose result follows a decode step's, with
-            # that step's batch size, drafts and fake GPU time, in sync and async mode alike.
+            # that step's batch size, drafts, KV tokens and fake GPU time, in sync and async mode alike.
             last, previous = model.results[-1], model.results[-2] if len(model.results) > 1 else None
-            if last[0] or previous is None or previous[0] or (batch_size, num_drafts, seconds) != last[1:]:
-                raise Violation(f"step time {(batch_size, num_drafts, seconds)} recorded after results {previous}, {last}")
+            if last[0] or previous is None or previous[0] or (batch_size, num_drafts, kv_tokens, seconds) != last[1:]:
+                raise Violation(f"step time {(batch_size, num_drafts, kv_tokens, seconds)} recorded after results {previous}, {last}")
             model.num_recorded_step_times += 1
-            record(batch_size, num_drafts, seconds)
+            record(batch_size, num_drafts, kv_tokens, seconds)
+
+        def checked_choice(batch_size, kv_tokens):
+            # The scheduler asks for the batch it is about to schedule, with its sequences' cached
+            # tokens, and gets a number of drafts as good as the best by its step times (see
+            # FakeModel.expected_k_by_cost); _decode checks that the step proposed it.
+            running = list(engine.scheduler.running)[:batch_size]
+            if batch_size != min(len(engine.scheduler.running), engine.scheduler.max_num_seqs) or kv_tokens != sum(seq.num_cached_tokens for seq in running):
+                raise Violation(f"k chosen for {batch_size} sequences and {kv_tokens} KV tokens, running {[(seq.seq_id, seq.num_cached_tokens) for seq in engine.scheduler.running]}")
+            k = choose(batch_size, kv_tokens)
+            model.check_k_by_cost(engine.scheduler, kv_tokens, k)
+            model.k_by_cost_choice = (engine.scheduler.decode_step_index, k)
+            return k
 
         engine.scheduler.record_step_time = checked_record
+        engine.scheduler.num_drafts_by_cost = checked_choice
     return engine
 
 
@@ -381,6 +431,7 @@ class FakeModel:
         self.kv = [None] * (num_blocks * block_size)
         self.draft_kv = [None] * (num_blocks * block_size) if draft_model or eagle else None    # the draft model's, or the head's
         self.eagle = eagle
+        self.separate_draft_model = draft_model and not eagle    # its drafts each read its own KV cache
         # The hidden cache an EAGLE-3 head reads (one "hidden" value per slot, plus the spare row
         # masked slots write to): the target writes its prefix hash at every row it scores.
         self.hidden_cache = torch.zeros(num_blocks * block_size + 1, 1, dtype=torch.int64) if eagle else None
@@ -407,16 +458,24 @@ class FakeModel:
         # A fake GPU clock in integer time units (exact in floats): a step queues behind the previous
         # one and takes step_cost; reading its result moves the engine's clock to its end.
         self.now = self.gpu_free = 0
-        self.decode_cost = (0, 0, 0)    # (per row, jump, rows per sequence above which the jump applies): see step_cost
-        self.results = []               # (is_prefill, batch size, drafts, cost) of every step whose result was read, in order
+        self.decode_cost = (0, 0, 0, 0, 0)    # (per row, jump, rows per sequence above which the jump applies, per KV token, per KV token and draft): see step_cost
+        self.pause = (0, 0)             # (every how many decode steps, how long): a step held up now and then
+        self.num_decode_costs = 0
+        self.results = []               # (is_prefill, batch size, drafts, KV tokens, cost) of every step whose result was read, in order
+        self.k_by_cost_choice = None    # (decode step index, k) of the scheduler's last choice by cost
         self.num_decode_after_decode = self.num_recorded_step_times = 0
 
     def step_cost(self, seqs, is_prefill):
         if is_prefill:
             return 1000 + 10 * sum(seq.num_scheduled_tokens for seq in seqs)
+        # A decode step reads the KV of every context (and a draft model's, once per draft): its
+        # time grows as the contexts do.
         q = max(seq.num_scheduled_tokens for seq in seqs)
-        per_row, jump, jump_above = self.decode_cost
-        return 1000 + per_row * len(seqs) * q + jump * (q > jump_above)
+        per_row, jump, jump_above, per_kv, per_kv_draft = self.decode_cost
+        kv_tokens = sum(seq.num_cached_tokens for seq in seqs)
+        self.num_decode_costs += 1
+        every, pause = self.pause
+        return 1000 + per_row * len(seqs) * q + jump * (q > jump_above) + (per_kv + per_kv_draft * (q - 1)) * kv_tokens + (pause if every and self.num_decode_costs % every == 0 else 0)
 
     def read_result(self, finish, info):
         self.now = max(self.now, finish)
@@ -438,7 +497,8 @@ class FakeModel:
 
     def call(self, method_name, seqs, is_prefill):
         cost = self.step_cost(seqs, is_prefill)    # before run: the step's sizes, as the scheduler set them
-        info = (is_prefill, len(seqs), 0 if is_prefill else max(seq.num_scheduled_tokens for seq in seqs) - 1, cost)
+        info = (is_prefill, len(seqs), 0 if is_prefill else max(seq.num_scheduled_tokens for seq in seqs) - 1,
+                0 if is_prefill else sum(seq.num_cached_tokens for seq in seqs), cost)
         token_ids = self.run(seqs, is_prefill)
         for seq, t in zip(seqs, token_ids):
             if not is_prefill or seq.num_cached_tokens + seq.num_scheduled_tokens == seq.num_tokens:
@@ -560,23 +620,36 @@ class FakeModel:
                 raise Violation(f"seq {seq.seq_id}: draft inputs {ids[starts[i] + 1:starts[i] + 1 + num_drafts[i]]} != proposed {draft_model.drafts[i]}")
         return ids, draft_model.drafts
 
-    def expected_k_by_cost(self, scheduler):
+    def check_k_by_cost(self, scheduler, kv_tokens, k):
+        """The scheduler's choice by cost, against its step times recomputed here in exact
+        arithmetic: the largest k with too few times, or else a k whose expected tokens per time
+        unit at kv_tokens, by the lines through the times (Scheduler.step_time_lines, fitted here as
+        a least-squares problem of its own), are the best's to rounding."""
         K = self.num_speculative_tokens
         # The simulated batches never exceed 8 sequences, the smallest bucket.
         if scheduler.max_num_seqs > 8 or list(scheduler.step_times) != [8]:
             raise Violation(f"step times kept for buckets {list(scheduler.step_times)}")
         table = scheduler.step_times[8]
-        if any(index < scheduler.decode_step_index - 1 - scheduler.STEP_TIME_MAX_AGE for samples in table for index, _ in samples):
+        if any(index < scheduler.decode_step_index - scheduler.STEP_TIME_MAX_AGE for samples in table for index, _, _ in samples):
             raise Violation(f"step times older than {scheduler.STEP_TIME_MAX_AGE} decode steps kept: {table} at step {scheduler.decode_step_index}")
-        untimed = [k for k in range(K + 1) if len(table[k]) < scheduler.MIN_STEP_TIME_SAMPLES]
+        untimed = [j for j in range(K + 1) if len(table[j]) < scheduler.MIN_STEP_TIME_SAMPLES]
         if untimed:
-            return max(untimed)
+            if k != max(untimed):
+                raise Violation(f"{k} drafts chosen, {max(untimed)} still to be timed: {table}")
+            return
+        times = [[(Fraction(x), Fraction(t)) for _, x, t in samples] for samples in table]
+        slopes = fit_slopes(times, self.separate_draft_model)
         rates, expected = [], 1.0
-        for k in range(K + 1):
-            expected += scheduler.acceptance[k] if k else 0.0    # summed in the scheduler's order, so that ties stay ties
-            times = sorted(seconds for _, seconds in table[k])
-            rates.append(expected / times[(len(times) - 1) // 2])
-        return rates.index(max(rates))
+        for j in range(K + 1):
+            expected += scheduler.acceptance[j] if j else 0.0    # summed in the scheduler's order
+            slope = min([max(Fraction(0), slopes[j])] + [t / x for x, t in times[j] if x > 0])
+            seconds = median_low([t - slope * x for x, t in times[j]]) + slope * kv_tokens
+            if seconds <= 0:    # a decode step attends to every prompt: the line is above 0 there
+                raise Violation(f"{j} drafts take {seconds} at {kv_tokens} KV tokens by the step times {table}")
+            rates.append(Fraction(expected) / seconds)
+        if rates[k] < max(rates) * (1 - Fraction(1, 10 ** 9)):
+            raise Violation(f"{k} drafts chosen at {kv_tokens} KV tokens, rates {[float(r) for r in rates]}, "
+                            f"acceptance {scheduler.acceptance[1:]}, step times {table}")
 
     def _decode(self, seqs, meta):
         bs = self.block_size
@@ -627,8 +700,10 @@ class FakeModel:
                 expected = 0
             elif self.steps_without_probe >= scheduler.PROBE_INTERVAL:
                 expected = K
+            elif self.k_by_cost_choice is None or self.k_by_cost_choice[0] != scheduler.decode_step_index - 1:
+                raise Violation(f"decode step {scheduler.decode_step_index - 1} scheduled without a choice by cost (last {self.k_by_cost_choice})")
             else:
-                expected = self.expected_k_by_cost(scheduler)
+                expected = self.k_by_cost_choice[1]    # checked against the step times in check_k_by_cost
             if q - 1 != expected:
                 raise Violation(f"decode step with {q - 1} drafts, expected {expected} at acceptance {[round(a, 3) for a in scheduler.acceptance[1:]]}, "
                                 f"step times {scheduler.step_times}, after {self.steps_without_probe} steps without a probe")
@@ -964,7 +1039,9 @@ def set_step_costs(engine, rng):
     scheduler.STEP_TIME_WINDOW = rng.randint(1, 6)
     scheduler.MIN_STEP_TIME_SAMPLES = rng.randint(1, scheduler.STEP_TIME_WINDOW)
     scheduler.STEP_TIME_MAX_AGE = rng.randint(2, 40)
-    engine.model_runner.decode_cost = (rng.randint(0, 200), rng.choice([0, rng.randint(1, 2000)]), rng.randint(1, scheduler.num_speculative_tokens + 1))
+    engine.model_runner.decode_cost = (rng.randint(0, 200), rng.choice([0, rng.randint(1, 2000)]), rng.randint(1, scheduler.num_speculative_tokens + 1),
+                                       rng.choice([0, rng.randint(1, 40)]), rng.choice([0, rng.randint(1, 40)]))
+    engine.model_runner.pause = (rng.choice([0, rng.randint(2, 9)]), rng.randint(1, 5000))
 
 
 def run_random_case(seed, async_scheduling=False, num_speculative_tokens=0, draft_model=False, adaptive=False, acceptance=False, per_sequence=False, eagle=False,
